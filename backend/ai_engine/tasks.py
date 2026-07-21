@@ -5,7 +5,7 @@ from quiz.models import Option, Question
 from quiz.serializers import QuestionSerializer
 from sops.models import SOPDocument
 
-from .services import generate_questions
+from .services import answer_sop_question, generate_questions
 
 
 def _normalize(text):
@@ -94,3 +94,25 @@ def generate_quiz_task(sop_id, job_role_id, count, user_id=None):
     ).prefetch_related("options")
     serializer = QuestionSerializer(questions, many=True)
     return {"questions": serializer.data, "source": overall_source, "skipped_duplicates": skipped_duplicates}
+
+
+@shared_task
+def answer_sop_question_task(sop_id, question, user_id=None):
+    """RAG-based SOP chatbot: answer a free-text question grounded in one SOP's own
+    chunks. Runs on a Celery worker for the same reason generate_quiz_task does — a
+    slow NVIDIA NIM call shouldn't occupy a web request thread."""
+    from django.contrib.auth import get_user_model
+
+    sop = SOPDocument.objects.get(id=sop_id)
+    user = get_user_model().objects.filter(id=user_id).first() if user_id else None
+    chunks = list(sop.chunks.all())
+
+    answer, sections_used, source = answer_sop_question(sop.title, question, chunks)
+
+    log_action(
+        user, "sop_chat_query", sop,
+        summary=f"{user or 'A user'} asked a question about {sop.sop_code}: \"{question[:80]}\"",
+        details={"question": question, "source": source, "sections_used": sections_used},
+    )
+
+    return {"answer": answer, "sections_used": sections_used, "source": source, "sop_id": sop.id, "sop_code": sop.sop_code}

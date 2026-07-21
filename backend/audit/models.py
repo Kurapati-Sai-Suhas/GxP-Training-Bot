@@ -14,6 +14,7 @@ class AuditLog(models.Model):
         ("question_approved", "Question Approved"),
         ("question_rejected", "Question Rejected"),
         ("quiz_attempt_submitted", "Quiz Attempt Submitted"),
+        ("sop_chat_query", "SOP Chat Query"),
     ]
 
     user = models.ForeignKey(

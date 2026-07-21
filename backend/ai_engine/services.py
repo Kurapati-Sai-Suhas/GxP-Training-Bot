@@ -178,3 +178,114 @@ def generate_questions(role_name, sop_chunk, number_of_questions=1):
         return drafts, "nvidia_nim"
     except Exception:
         return generate_mock_questions(role_name, sop_chunk, number_of_questions), "mock"
+
+
+# --- RAG-based SOP chatbot -------------------------------------------------
+#
+# "Retrieval" here is deliberately simple: a word-overlap score over the SOP's
+# own chunks, not an embeddings/vector search. Chunking-strategy research already
+# cited in this project (heading-aware chunking beating embeddings on structured
+# technical documents) motivates the same call here — a typical SOP has a handful
+# of short chunks, so a lightweight lexical filter selects the relevant ones with
+# no new infrastructure (no embeddings model, no vector DB), while still capping
+# how much text is stuffed into the prompt as the document grows. The live path
+# is grounded exclusively in the selected chunk text (see the prompt below); the
+# offline path answers by quoting the best-matching chunk directly, so both paths
+# satisfy "grounded in the SOP's own chunks" even with no NVIDIA_API_KEY configured.
+
+_WORD_PATTERN = re.compile(r"[a-zA-Z]{4,}")
+MAX_CHAT_QUESTION_LENGTH = 500
+
+
+def _significant_words(text):
+    return {word.lower() for word in _WORD_PATTERN.findall(text)}
+
+
+def select_relevant_chunks(question, chunks, max_chunks=6):
+    """Rank a SOP's chunks by lexical overlap with the question; ties (including
+    the all-zero-overlap case) keep the chunks' original document order, so a
+    question with no keyword overlap still gets the SOP's opening sections
+    rather than nothing at all."""
+    question_words = _significant_words(question)
+    scored = []
+    for index, chunk in enumerate(chunks):
+        overlap = len(question_words & _significant_words(chunk.chunk_text))
+        scored.append((overlap, -index, chunk))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [chunk for _score, _index, chunk in scored[:max_chunks]]
+
+
+def build_sop_chat_prompt(sop_title, question, chunks):
+    sections = "\n\n".join(
+        f"[{chunk.section_title or 'Untitled section'}]\n{chunk.chunk_text}" for chunk in chunks
+    )
+    return f"""
+You are a GxP training assistant helping an employee understand one specific SOP.
+
+Rules:
+- Answer using ONLY the SOP text below. Do not use any outside knowledge.
+- If the answer is not covered by this text, say so plainly: "This SOP does not cover that —
+  please check with your supervisor or QA." Do not guess.
+- Keep the answer to 2-4 sentences, and name the section it comes from.
+
+SOP: {sop_title}
+
+{sections}
+
+Question: {question}
+"""
+
+
+def answer_sop_question_with_nvidia_nim(sop_title, question, chunks):
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY is not configured")
+
+    relevant_chunks = select_relevant_chunks(question, chunks, max_chunks=6)
+    client = OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
+    last_error = None
+    for attempt in range(1, NVIDIA_NIM_MAX_ATTEMPTS + 1):
+        try:
+            result = client.chat.completions.create(
+                model=NVIDIA_NIM_MODEL,
+                messages=[
+                    {"role": "system", "content": "Answer strictly from the provided SOP text."},
+                    {"role": "user", "content": build_sop_chat_prompt(sop_title, question, relevant_chunks)},
+                ],
+                temperature=0.2,
+            )
+            answer = result.choices[0].message.content.strip()
+            sections_used = [c.section_title or "Untitled section" for c in relevant_chunks]
+            return answer, sections_used
+        except Exception as exc:  # noqa: BLE001 - same fallback contract as generate_questions_with_nvidia_nim
+            last_error = exc
+            if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
+                time.sleep(NVIDIA_NIM_RETRY_BACKOFF_SECONDS * attempt)
+    raise last_error
+
+
+def answer_sop_question_offline(question, chunks):
+    """Deterministic fallback: quote the single best-matching chunk instead of
+    generating prose, so the app never depends on NVIDIA NIM being reachable."""
+    top_chunks = select_relevant_chunks(question, chunks, max_chunks=1)
+    if not top_chunks:
+        return (
+            "This SOP has no processed content to answer from yet.",
+            [],
+        )
+    chunk = top_chunks[0]
+    section = chunk.section_title or "this SOP"
+    excerpt = chunk.chunk_text.strip()[:400]
+    answer = f"Based on \"{section}\": {excerpt}"
+    return answer, [chunk.section_title or "Untitled section"]
+
+
+def answer_sop_question(sop_title, question, chunks):
+    """Try the live NVIDIA NIM chatbot; fall back to a deterministic chunk quote
+    on any failure. Returns (answer, sections_used, source)."""
+    try:
+        answer, sections_used = answer_sop_question_with_nvidia_nim(sop_title, question, chunks)
+        return answer, sections_used, "nvidia_nim"
+    except Exception:
+        answer, sections_used = answer_sop_question_offline(question, chunks)
+        return answer, sections_used, "mock"

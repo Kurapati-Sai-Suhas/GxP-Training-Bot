@@ -73,6 +73,7 @@ Main API groups:
 /api/sops/documents/                          writes: Admin only; file validated server-side (type allowlist + 20MB cap)
 /api/sops/documents/{id}/process/             POST  Admin only
 /api/ai_engine/generate/                      POST  Admin only  {sop, job_role, count, difficulty}
+/api/ai_engine/sop-chat/                      POST  (auth required) {sop, question} -> RAG answer grounded in that SOP's chunks
 /api/quiz/questions/                          supports ?sop=&job_role=&status= filters; includes confidence_score
 /api/quiz/questions/{id}/approve/             PATCH Admin or SME Reviewer, requires {password} (electronic signature)
 /api/quiz/questions/{id}/reject/              PATCH Admin or SME Reviewer, requires {password} (electronic signature)
@@ -128,7 +129,7 @@ cd backend
 uv run python manage.py test
 ```
 
-51 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation (no live API key needed to run tests), electronic-signature boundary tests (missing/wrong password on approve/reject), adaptive-retraining scheduling tests, and regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
+59 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation and the SOP chatbot (no live API key needed to run tests), electronic-signature boundary tests (missing/wrong password on approve/reject), adaptive-retraining scheduling tests, and regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
 
 ## Current Scope
 
@@ -137,6 +138,7 @@ uv run python manage.py test
 - AI quiz generation via NVIDIA NIM per SOP chunk, with a retry-with-backoff on transient failures, an offline fallback generator, and duplicate-question detection, wired into the Generate Quiz screen with a live/offline badge
 - Each AI-drafted question carries a self-reported `confidence_score` (0.0–1.0), surfaced as a badge in Question Review so reviewer attention concentrates on the drafts the model was least sure about
 - Question approval/rejection workflow, backend + UI, gated to Admin/SME Reviewer, and now requires an electronic signature (password re-entry) at the point of approval/rejection — the audit log records `e_signature: true` on each such entry
+- **RAG-based SOP chatbot** — any authenticated user can ask a free-text question about a processed SOP on the SOP Library screen; the answer is grounded exclusively in that SOP's own chunks (word-overlap relevance selection, not embeddings), with the same NVIDIA NIM / offline-fallback pattern as quiz generation, and every query is written to the audit trail
 - Token-based auth with three role tiers (Admin / SME Reviewer / Learner), enforced on both the API and the UI
 - Append-only audit trail for every write action, an Admin-only CSV export of the trail (`/api/audit/logs/export/`, also a button on the Dashboard), and read access via Django admin
 - Learner Quiz: real approved-question fetch (scoped to the learner's role), real `QuizAttempt` creation, real scoring + per-question explanations on submit, a "Recommended Refresher" card (the SOP the learner has personally missed the most, ever), and an **adaptive-retraining "Adaptive Retraining Due" card** driven by a literature-grounded Leitner-style spaced-repetition scheduler (`TopicMastery` model) — both are soft assignments the learner still starts themselves through the normal quiz flow
@@ -150,6 +152,6 @@ See `ROADMAP.md` and Section 9 of the SRS for the full list. What's genuinely st
 
 - Embeddings-based/vector-search chunking (the current chunker is heading-aware but not semantic) — two independent 2026 chunking-strategy studies on structured technical documents found semantic chunking didn't reliably outperform structure-aware chunking, so this is treated as a worthwhile experiment rather than an urgent fix (see `ROADMAP.md` Day 5 literature notes)
 - Hard auto-assignment (the system pre-creating a live `QuizAttempt` before the learner acts) — deliberately not built; soft assignment (surface it, learner still starts it) was the chosen scope, see `ROADMAP.md` Day 6
-- RAG-based free-text SOP Q&A (a learner asking an open question about an SOP, grounded in its chunks) — named as the natural next AI-layer extension
-- Frontend test suite (backend has 51 tests; frontend has none yet)
+- Multi-turn SOP chat (today's chatbot is single-turn: one question, one grounded answer, no conversation memory)
+- Frontend test suite (backend has 59 tests; frontend has none yet)
 - `frontend/package-lock.json` is gitignored, so CI uses `npm install` instead of `npm ci` — committing the lockfile would make builds reproducible

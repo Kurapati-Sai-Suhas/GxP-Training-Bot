@@ -155,6 +155,10 @@ export async function generateQuiz({ sop, jobRole, count, difficulty }) {
   return postJson("/ai_engine/generate/", { sop, job_role: jobRole, count, difficulty });
 }
 
+export async function askSopQuestion({ sop, question }) {
+  return postJson("/ai_engine/sop-chat/", { sop, question });
+}
+
 export async function createQuizAttempt({ sop, jobRole }) {
   return postJson("/attempts/quiz-attempts/", { sop, job_role: jobRole });
 }

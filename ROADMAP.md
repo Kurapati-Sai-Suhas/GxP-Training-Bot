@@ -116,13 +116,29 @@ Scope: close the "full adaptive retraining" gap named at the end of Day 5 — no
 
 ---
 
+## Day 7 — RAG-based SOP chatbot — ✅ DONE
+
+Scope: close the last named Future Scope item — "let a learner ask a free-text question about an SOP and get an answer grounded in that SOP's chunks" — as a genuinely additive companion to the quiz flow, not a replacement for it.
+
+- [x] **7.1 Retrieval design** — deliberately lexical (word-overlap scoring over a SOP's own chunks), not embeddings-based. Same rationale as the Day 5 chunking decision: a typical SOP has a handful of short chunks, so a keyword filter selects the relevant ones with zero new infrastructure (no embeddings model, no vector DB), while still capping how much text gets stuffed into the prompt as a document grows. `select_relevant_chunks()` (`ai_engine/services.py`) ranks chunks by significant-word overlap with the question, falling back to document order (not an empty result) when nothing overlaps.
+- [x] **7.2 Live + offline paths, same contract as quiz generation** — `answer_sop_question_with_nvidia_nim()` builds a prompt that instructs the model to answer only from the supplied chunk text and say so plainly if the SOP doesn't cover the question (a direct application of the hallucination-mitigation literature from Day 5's first research pass). `answer_sop_question_offline()` quotes the single best-matching chunk verbatim instead of generating prose, so the feature never hard-depends on NVIDIA NIM being reachable — consistent with every other AI-backed feature in this project.
+- [x] **7.3 New endpoint, no existing code touched** — `POST /api/ai_engine/sop-chat/` (`ai_engine/views.py`, dispatched through a new `answer_sop_question_task` Celery task, same `.delay().get(timeout=...)` pattern as quiz generation). Open to any authenticated role — matches the existing read access to `SOPChunk`/`SOPDocument`, which was never role-scoped to begin with; only `Question`/`QuizAttempt` are.
+- [x] **7.4 Audit trail** — a new `sop_chat_query` action added to `AuditLog.ACTION_CHOICES` (migration `audit/0002_alter_auditlog_action`); every question asked is logged with the question text, which source answered it, and which sections were used.
+- [x] **7.5 Frontend** — a new "Ask About an SOP" card on the SOP Library screen: pick a processed SOP, type a question, see the grounded answer plus a live/offline badge and the cited section titles.
+- [x] **7.6 Tests** — 8 new tests: a pure-function unit test for the chunk-ranking logic (including the no-overlap fallback), and endpoint tests for auth, validation (missing fields, a 500-character question cap, an unprocessed SOP), the forced-offline path, and the audit-log entry. 59 backend tests total, all passing.
+- [x] **7.7 Live verification** — ran the real dev server with the real `NVIDIA_API_KEY`, asked "What order should I put on my gloves and other garments?" about SOP-300 through the actual UI, and got back a live NVIDIA NIM answer correctly grounded in and citing "Section 2: Gowning Sequence" — confirmed via the network request, the rendered answer, and the resulting `AuditLog` row.
+
+**End of Day 7 checkpoint:** the RAG-based SOP chatbot is built, grounded in the same literature already cited for chunking and hallucination mitigation, tested, and verified live with a real LLM call — additive throughout, no existing model/view/test modified. ✅ Confirmed working.
+
+---
+
 ## What's left (genuinely out of scope, not just deferred busywork)
 
 - Embeddings-based/vector-search chunking (the chunker is heading-aware, and Day 5's literature review found this is a defensible trade-off on structured documents, not just a shortcut — still worth trying)
-- RAG-based free-text SOP Q&A for learners (a natural next AI-layer feature, not yet built)
 - Hard auto-assignment (pre-creating a live `QuizAttempt` before the learner acts) — deliberately scoped out on Day 6 in favor of soft assignment; would need a design decision on what an unstarted system-created attempt means for completion-rate stats before building
 - Concept-clustering via LLM semantic similarity (LECTOR-style — Zhao 2025) to treat related weak topics as reinforcing each other — named in the Day 6 literature pass as the one "modern" refinement worth bolting on later, not built now
-- Frontend test suite (backend has 51 tests; frontend has none)
+- Multi-turn SOP chat with conversation memory (today's chatbot is single-turn by design — Day 7 scope was one question in, one grounded answer out)
+- Frontend test suite (backend has 59 tests; frontend has none)
 - Committing `frontend/package-lock.json` (currently gitignored) so CI can use `npm ci` instead of `npm install`
 
 These are captured in `docs/SRS_GxP_Training_Bot.docx` Section 9 as the real remaining "future work" list, and `DEMO_SCRIPT.md`'s judge-question table covers how to talk about them live.

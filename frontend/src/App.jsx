@@ -34,6 +34,7 @@ import {
 import "./styles/app.css";
 import {
   approveQuestion,
+  askSopQuestion,
   createQuizAttempt,
   createSopDocument,
   downloadAuditLogCsv,
@@ -375,6 +376,31 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
   const [error, setError] = useState(null);
   const [message, setMessage] = useState(null);
 
+  const askableSops = documents?.filter((doc) => doc.status === "processed") ?? [];
+  const [chatSopId, setChatSopId] = useState("");
+  const [question, setQuestion] = useState("");
+  const [chatResult, setChatResult] = useState(null);
+  const [isAsking, setIsAsking] = useState(false);
+  const [chatError, setChatError] = useState(null);
+
+  async function handleAsk() {
+    if (!chatSopId || !question.trim()) {
+      setChatError("Pick an SOP and type a question first.");
+      return;
+    }
+    setIsAsking(true);
+    setChatError(null);
+    setChatResult(null);
+    try {
+      const data = await askSopQuestion({ sop: Number(chatSopId), question: question.trim() });
+      setChatResult(data);
+    } catch (err) {
+      setChatError(err.message || "Could not get an answer.");
+    } finally {
+      setIsAsking(false);
+    }
+  }
+
   const documentsToShow = documents?.length
     ? documents.map((item) => ({
         code: item.sop_code,
@@ -534,6 +560,54 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
             </tbody>
           </table>
         </div>
+      </section>
+
+      <section className="card section-gap">
+        <div className="card__title">
+          Ask About an SOP <small>Answers grounded in that SOP's own text</small>
+        </div>
+        {askableSops.length === 0 ? (
+          <p className="muted-small">No processed SOPs yet — process one before asking questions about it.</p>
+        ) : (
+          <>
+            <div className="form-grid">
+              <label className="field">
+                <span>SOP</span>
+                <select onChange={(event) => setChatSopId(event.target.value)} value={chatSopId}>
+                  <option value="">Select an SOP...</option>
+                  {askableSops.map((doc) => (
+                    <option key={doc.id} value={doc.id}>
+                      {doc.sop_code} - {doc.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="field">
+              <span>Your question</span>
+              <textarea
+                onChange={(event) => setQuestion(event.target.value)}
+                placeholder="e.g. What order should I put on my gloves?"
+                value={question}
+              />
+            </label>
+            {chatError && <p className="text-error">{chatError}</p>}
+            <div className="button-row">
+              <button className="btn btn--primary" disabled={isAsking} onClick={handleAsk} type="button">
+                <Send size={14} /> {isAsking ? "Asking..." : "Ask"}
+              </button>
+            </div>
+            {chatResult && (
+              <div className="q-card__explanation" style={{ marginTop: "12px" }}>
+                <strong>Answer:</strong> {chatResult.answer}
+                <div className="muted-small" style={{ marginTop: "6px" }}>
+                  Source: {chatResult.source === "nvidia_nim" ? "generated live by NVIDIA NIM" : "offline fallback"}
+                  {chatResult.sections_used?.length > 0 && ` · From: ${chatResult.sections_used.join(", ")}`}
+                </div>
+              </div>
+            )}
+          </>
+        )}
       </section>
     </div>
   );
