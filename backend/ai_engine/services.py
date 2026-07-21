@@ -2,11 +2,14 @@ import json
 import os
 import random
 import re
+import time
 
 from openai import OpenAI
 
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_NIM_MODEL = "meta/llama-3.1-8b-instruct"
+NVIDIA_NIM_MAX_ATTEMPTS = 3
+NVIDIA_NIM_RETRY_BACKOFF_SECONDS = 0.5
 
 REQUIRED_KEYS = {"question_text", "options", "correct_option_index", "explanation"}
 
@@ -27,7 +30,11 @@ Create {number_of_questions} role-specific multiple-choice questions for the rol
 Rules:
 - Use only the SOP text below.
 - Return valid JSON only: a JSON array of question objects (no wrapping object, no markdown fences).
-- Each question object must include question_text, difficulty (easy/medium/hard), options (array of 4 strings), correct_option_index (0-based int), explanation.
+- Each question object must include question_text, difficulty (easy/medium/hard), options (array of 4 strings), correct_option_index (0-based int), explanation, confidence.
+- confidence is your own estimate, from 0.0 to 1.0, of how unambiguous and well-supported this
+  question and its correct answer are given only the SOP text above. Use a lower value when the
+  SOP text is vague, when more than one option could reasonably be argued as correct, or when you
+  had to infer beyond what the text states outright.
 - Explanation must explain why the correct answer is compliant and why the wrong answers are risky.
 
 SOP text:
@@ -41,6 +48,14 @@ def _strip_markdown_fences(content):
         cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
         cleaned = re.sub(r"\n?```$", "", cleaned)
     return cleaned.strip()
+
+
+def _normalize_confidence(raw_value):
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, value))
 
 
 def _normalize_drafts(parsed):
@@ -62,6 +77,7 @@ def _normalize_drafts(parsed):
                 "options": item["options"],
                 "correct_option_index": int(item["correct_option_index"]),
                 "explanation": item["explanation"],
+                "confidence": _normalize_confidence(item.get("confidence")),
             }
         )
     if not drafts:
@@ -75,17 +91,28 @@ def generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions
         raise RuntimeError("NVIDIA_API_KEY is not configured")
 
     client = OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
-    result = client.chat.completions.create(
-        model=NVIDIA_NIM_MODEL,
-        messages=[
-            {"role": "system", "content": "Return strict JSON for a GxP quiz generation task."},
-            {"role": "user", "content": build_quiz_prompt(role_name, sop_chunk, number_of_questions)},
-        ],
-        temperature=0.2,
-    )
-    content = _strip_markdown_fences(result.choices[0].message.content)
-    drafts = _normalize_drafts(json.loads(content))
-    return drafts[:number_of_questions]
+    last_error = None
+    # A single bad response (network blip, rate limit, occasionally-malformed JSON from
+    # the model) shouldn't drop straight to the offline fallback — retry a couple of times
+    # with a short linear backoff first, then let the caller fall back as before.
+    for attempt in range(1, NVIDIA_NIM_MAX_ATTEMPTS + 1):
+        try:
+            result = client.chat.completions.create(
+                model=NVIDIA_NIM_MODEL,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON for a GxP quiz generation task."},
+                    {"role": "user", "content": build_quiz_prompt(role_name, sop_chunk, number_of_questions)},
+                ],
+                temperature=0.2,
+            )
+            content = _strip_markdown_fences(result.choices[0].message.content)
+            drafts = _normalize_drafts(json.loads(content))
+            return drafts[:number_of_questions]
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see fallback contract below
+            last_error = exc
+            if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
+                time.sleep(NVIDIA_NIM_RETRY_BACKOFF_SECONDS * attempt)
+    raise last_error
 
 
 HEADING_PATTERN = re.compile(r"^(section|chapter|part|appendix)\s+\d", re.IGNORECASE)
@@ -131,6 +158,10 @@ def generate_mock_questions(role_name, sop_chunk, number_of_questions=5):
                     "The other options are incorrect because they weaken, skip, or invert this documented "
                     "requirement, which would create a compliance risk if followed in practice."
                 ),
+                # Unlike the live LLM's self-reported estimate, the mock generator's correct
+                # option is copied verbatim from the SOP text by construction, so 1.0 reflects
+                # genuine certainty rather than a guess.
+                "confidence": 1.0,
             }
         )
     return drafts

@@ -26,12 +26,15 @@ class AuditTrailTests(APITestCase):
 
     def test_approve_writes_an_attributed_audit_log_entry(self):
         self.client.force_authenticate(user=self.admin)
-        self.client.patch(f"/api/quiz/questions/{self.question.id}/approve/")
+        self.client.patch(
+            f"/api/quiz/questions/{self.question.id}/approve/", {"password": "demo12345"}, format="json"
+        )
 
         entry = AuditLog.objects.get(action="question_approved")
         self.assertEqual(entry.user, self.admin)
         self.assertEqual(entry.object_id, self.question.id)
         self.assertIn(str(self.question.id), entry.summary)
+        self.assertTrue(entry.details.get("e_signature"))
 
     def test_audit_log_read_requires_admin(self):
         response = self.client.get("/api/audit/logs/")
@@ -44,6 +47,24 @@ class AuditTrailTests(APITestCase):
         self.client.force_authenticate(user=self.admin)
         response = self.client.get("/api/audit/logs/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_audit_log_export_csv_requires_admin(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/audit/logs/export/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_audit_log_export_csv_returns_rows_for_admin(self):
+        self.client.force_authenticate(user=self.admin)
+        self.client.patch(
+            f"/api/quiz/questions/{self.question.id}/approve/", {"password": "demo12345"}, format="json"
+        )
+
+        response = self.client.get("/api/audit/logs/export/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response["Content-Type"], "text/csv")
+        body = response.content.decode("utf-8")
+        self.assertIn("Timestamp,User,Action,Object Type,Object ID,Summary,Details", body)
+        self.assertIn("Question Approved", body)
 
     def test_audit_log_is_append_only_via_admin_site(self):
         from django.contrib import admin as django_admin

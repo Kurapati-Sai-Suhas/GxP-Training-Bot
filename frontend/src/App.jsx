@@ -36,6 +36,7 @@ import {
   approveQuestion,
   createQuizAttempt,
   createSopDocument,
+  downloadAuditLogCsv,
   generateQuiz,
   getApprovedQuestionsForRole,
   getDashboardSummary,
@@ -43,6 +44,7 @@ import {
   getLearnerProfiles,
   getMe,
   getQuestions,
+  getRecommendedRefresher,
   getSopDocuments,
   getStoredToken,
   login,
@@ -229,7 +231,20 @@ const compliance = [
   { label: "Maintenance", value: 66 },
 ];
 
-function Dashboard({ summary, apiStatus }) {
+function Dashboard({ summary, apiStatus, isAdmin }) {
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport() {
+    setExporting(true);
+    try {
+      await downloadAuditLogCsv();
+    } catch {
+      // Best-effort: the button simply becomes clickable again so the admin can retry.
+    } finally {
+      setExporting(false);
+    }
+  }
+
   const stats = summary
     ? [
         { label: "SOPs Processed", value: summary.processed_sops, delta: `${summary.sops} total SOPs`, icon: FileText },
@@ -248,7 +263,16 @@ function Dashboard({ summary, apiStatus }) {
       <PageHeader
         title="Training Overview"
         subtitle="Monitor SOP processing, question approval, and learner performance."
-        action={<DataStatus status={apiStatus} />}
+        action={
+          <div className="badge-row">
+            <DataStatus status={apiStatus} />
+            {isAdmin && (
+              <button className="btn" type="button" onClick={handleExport} disabled={exporting}>
+                <Download size={14} /> {exporting ? "Exporting…" : "Export Audit Log"}
+              </button>
+            )}
+          </div>
+        }
       />
 
       <div className="stats">
@@ -709,6 +733,11 @@ const reviewQuestions = [
 ];
 
 function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, onRejectQuestion }) {
+  const [pending, setPending] = useState(null); // { id, action, label }
+  const [password, setPassword] = useState("");
+  const [signatureError, setSignatureError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
   const questionsToShow = questions?.length
     ? questions.map((item) => ({
         id: item.id,
@@ -720,12 +749,38 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
         correct: Math.max(0, item.options.findIndex((option) => option.is_correct)),
         explanation: item.explanation,
         status: titleCase(item.status),
+        confidence: item.confidence_score,
         isLive: true,
       }))
     : reviewQuestions.map((item, index) => ({ ...item, id: `fallback-${index}`, status: "Pending Review", isLive: false }));
 
   const pendingCount = questions?.filter((item) => item.status === "draft").length ?? 12;
   const approvedCount = questions?.filter((item) => item.status === "approved").length ?? 48;
+
+  function openConfirm(item, action) {
+    setPending({ id: item.id, action });
+    setPassword("");
+    setSignatureError("");
+  }
+
+  async function confirmSignature() {
+    if (!pending) return;
+    setSubmitting(true);
+    setSignatureError("");
+    try {
+      if (pending.action === "approve") {
+        await onApproveQuestion(pending.id, password);
+      } else {
+        await onRejectQuestion(pending.id, password);
+      }
+      setPending(null);
+      setPassword("");
+    } catch (err) {
+      setSignatureError(err.message || "Could not confirm electronic signature.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <div className="page">
@@ -748,6 +803,7 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
               <span className="badge badge--uploaded">{item.role}</span>
               <span className={difficultyBadge[item.difficulty]}>{item.difficulty}</span>
               <span className={questionStatusBadge(item.status)}>{item.status}</span>
+              <ConfidenceBadge value={item.confidence} />
             </div>
             <div className="muted-small">Question #{index + 1}</div>
           </div>
@@ -761,7 +817,7 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
             <button
               className="btn btn--success"
               disabled={!canReview || !item.isLive || item.status === "Approved"}
-              onClick={() => onApproveQuestion(item.id)}
+              onClick={() => openConfirm(item, "approve")}
               type="button"
             >
               <Check size={14} /> Approve
@@ -770,7 +826,7 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
             <button
               className="btn btn--danger"
               disabled={!canReview || !item.isLive || item.status === "Rejected"}
-              onClick={() => onRejectQuestion(item.id)}
+              onClick={() => openConfirm(item, "reject")}
               type="button"
             >
               <X size={14} /> Reject
@@ -781,6 +837,42 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
           )}
         </article>
       ))}
+
+      {pending && (
+        <div className="esign-overlay">
+          <div className="esign-modal">
+            <h3>Confirm Electronic Signature</h3>
+            <p className="muted-small">
+              Re-enter your password to {pending.action === "approve" ? "approve" : "reject"} this question. This
+              confirmation is recorded in the compliance audit trail (21 CFR Part 11 electronic signature).
+            </p>
+            <label className="field">
+              <span>Password</span>
+              <input
+                autoFocus
+                onChange={(event) => setPassword(event.target.value)}
+                onKeyDown={(event) => event.key === "Enter" && !submitting && password && confirmSignature()}
+                type="password"
+                value={password}
+              />
+            </label>
+            {signatureError && <p className="text-error">{signatureError}</p>}
+            <div className="esign-actions">
+              <button className="btn" disabled={submitting} onClick={() => setPending(null)} type="button">
+                Cancel
+              </button>
+              <button
+                className={pending.action === "approve" ? "btn btn--success" : "btn btn--danger"}
+                disabled={submitting || !password}
+                onClick={confirmSignature}
+                type="button"
+              >
+                {submitting ? "Confirming…" : `Confirm & ${pending.action === "approve" ? "Approve" : "Reject"}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -798,6 +890,26 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
   const [isStarting, setIsStarting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState(null);
+  const [recommendation, setRecommendation] = useState(null);
+
+  useEffect(() => {
+    if (!jobRole) {
+      return;
+    }
+    let cancelled = false;
+    getRecommendedRefresher()
+      .then((data) => {
+        if (!cancelled) {
+          setRecommendation(data.recommendation);
+        }
+      })
+      .catch(() => {
+        // Purely a nice-to-have suggestion; a failure here shouldn't block the quiz flow.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jobRole]);
 
   useEffect(() => {
     if (!jobRole) {
@@ -977,6 +1089,23 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
     return (
       <div className="page">
         <PageHeader title="Learner Quiz" subtitle={`Approved quizzes available for ${jobRole.name}`} />
+        {recommendation && sopGroups.some((group) => String(group.id) === String(recommendation.sop_id)) && (
+          <section className="card">
+            <div className="card__title">
+              Recommended Refresher <small>Based on your past attempts</small>
+            </div>
+            <p className="muted-small">
+              {recommendation.reason} Consider retaking <strong>{recommendation.sop_code}</strong> ({recommendation.sop_title}) to reinforce this topic.
+            </p>
+            <button
+              className="btn btn--primary"
+              onClick={() => setSopId(String(recommendation.sop_id))}
+              type="button"
+            >
+              <RefreshCw size={14} /> Select {recommendation.sop_code} for Refresher
+            </button>
+          </section>
+        )}
         <section className="card">
           {sopGroups.length === 0 ? (
             <p className="muted-small">No approved questions are available for your role yet. Check back after QA review.</p>
@@ -1278,11 +1407,21 @@ function questionStatusBadge(status) {
   return "badge badge--draft";
 }
 
+function ConfidenceBadge({ value }) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const percent = Math.round(value * 100);
+  const tier = value >= 0.75 ? "high" : value >= 0.5 ? "medium" : "low";
+  const label = tier === "low" ? "Low confidence — review closely" : `${percent}% confidence`;
+  return <span className={`badge--confidence-${tier}`}>{label}</span>;
+}
+
 function OptionList({ options, correct }) {
   return (
     <div className="q-options">
       {options.map((option, index) => (
-        <div className={`q-option${index === correct ? " correct" : ""}`} key={option}>
+        <div className={`q-option${index === correct ? " correct" : ""}`} key={index}>
           <span className="marker">{String.fromCharCode(65 + index)}</span>
           <span>{option}</span>
           {index === correct && <span className="correct-label">Correct answer</span>}
@@ -1391,7 +1530,12 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+    // Re-run after login/logout (currentUser flips), not just on first mount: a fresh
+    // session has no stored token yet when this effect first fires, so the initial run
+    // always 401s into fallback data — without this dependency, a real login inside the
+    // same SPA session would leave the Dashboard stuck showing that fallback data forever
+    // instead of the real backend numbers, even though the user is now authenticated.
+  }, [currentUser]);
 
   async function handleLogin(username, password) {
     const user = await login(username, password);
@@ -1408,15 +1552,19 @@ function App() {
     setActivePage("dashboard");
   }
 
-  async function handleQuestionStatus(id, action) {
+  async function handleQuestionStatus(id, action, password) {
+    // Deliberately not caught here: approve/reject now requires an electronic-signature
+    // password, and the caller (the confirmation modal in QuestionReview) needs the real
+    // error message (e.g. "incorrect password") to show the reviewer, not a generic
+    // "offline" fallback state.
+    const updated = action === "approve" ? await approveQuestion(id, password) : await rejectQuestion(id, password);
+    setQuestions((current) => current.map((item) => (item.id === id ? updated : item)));
+    setApiStatus("connected");
     try {
-      const updated = action === "approve" ? await approveQuestion(id) : await rejectQuestion(id);
-      setQuestions((current) => current.map((item) => (item.id === id ? updated : item)));
       const summaryData = await getDashboardSummary();
       setSummary(summaryData);
-      setApiStatus("connected");
     } catch {
-      setApiStatus("fallback");
+      // Non-fatal: the approve/reject itself already succeeded.
     }
   }
 
@@ -1475,7 +1623,7 @@ function App() {
   const effectivePage = pageRequirement && !roles[pageRequirement] ? "dashboard" : activePage;
 
   const content = {
-    dashboard: <Dashboard summary={summary} apiStatus={apiStatus} />,
+    dashboard: <Dashboard summary={summary} apiStatus={apiStatus} isAdmin={roles.is_admin} />,
     "sop-library": (
       <SopLibrary apiStatus={apiStatus} canUpload={roles.is_admin} documents={documents} onUploaded={refreshAfterSopChange} />
     ),
@@ -1492,8 +1640,8 @@ function App() {
         canReview={roles.is_reviewer}
         questions={questions}
         apiStatus={apiStatus}
-        onApproveQuestion={(id) => handleQuestionStatus(id, "approve")}
-        onRejectQuestion={(id) => handleQuestionStatus(id, "reject")}
+        onApproveQuestion={(id, password) => handleQuestionStatus(id, "approve", password)}
+        onRejectQuestion={(id, password) => handleQuestionStatus(id, "reject", password)}
       />
     ),
     "learner-quiz": <LearnerQuiz currentUser={currentUser} onSubmitted={refreshAfterAttempt} />,

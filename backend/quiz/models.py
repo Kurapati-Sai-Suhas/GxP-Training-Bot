@@ -23,6 +23,10 @@ class Question(models.Model):
     difficulty = models.CharField(max_length=20, choices=DIFFICULTY_CHOICES, default="medium")
     explanation = models.TextField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
+    # The generator's own self-reported confidence (0.0-1.0) that this question and its
+    # correct answer are unambiguous and well-supported by the source SOP text. Null for
+    # questions created before this field existed, or created manually via the API.
+    confidence_score = models.FloatField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

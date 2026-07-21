@@ -1,5 +1,6 @@
 from django.db.models import Avg, Case, Count, FloatField, When
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from attempts.models import AttemptAnswer, QuizAttempt
@@ -80,5 +81,40 @@ def dashboard_summary(request):
             "recent_activity": recent_activity,
             "learner_progress": learner_progress,
             "weak_topics": weak_topics,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def recommended_refresher(request):
+    """Adaptive-retraining suggestion (extends FR-6.5's weak-topics aggregate to the
+    individual learner): find the SOP the requesting learner has personally answered
+    incorrectly most often across their own past attempts, and suggest it as a refresher
+    quiz. This is a recommendation surfaced on the Learner Quiz screen, not an
+    auto-assigned quiz — the learner still chooses to start it."""
+    rows = (
+        AttemptAnswer.objects.filter(attempt__learner=request.user, is_correct=False)
+        .values("question__sop_id", "question__sop__sop_code", "question__sop__title", "attempt__job_role_id")
+        .annotate(wrong_count=Count("id"))
+        .order_by("-wrong_count")
+    )
+    top = rows.first()
+    if not top:
+        return Response({"recommendation": None})
+
+    return Response(
+        {
+            "recommendation": {
+                "sop_id": top["question__sop_id"],
+                "sop_code": top["question__sop__sop_code"],
+                "sop_title": top["question__sop__title"],
+                "job_role_id": top["attempt__job_role_id"],
+                "wrong_count": top["wrong_count"],
+                "reason": (
+                    f"You've missed {top['wrong_count']} question"
+                    f"{'s' if top['wrong_count'] != 1 else ''} on this SOP in past attempts."
+                ),
+            }
         }
     )

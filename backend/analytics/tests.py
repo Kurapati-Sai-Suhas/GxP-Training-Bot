@@ -47,3 +47,46 @@ class DashboardSummaryTests(APITestCase):
         self.assertEqual(top["question_id"], self.hard_question.id)
         self.assertEqual(top["attempts"], 4)
         self.assertAlmostEqual(top["correct_rate"], 25.0, places=1)
+
+
+class RecommendedRefresherTests(APITestCase):
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.other_learner = get_user_model().objects.create_user(username="priya", password="demo12345")
+
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-900", version="v1.0", department="Production",
+            file="sops/sop-900.txt", status="processed",
+        )
+        self.question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Sample?", explanation="Because.", status="approved",
+        )
+
+    def test_recommends_nothing_without_any_wrong_answers(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/analytics/recommended-refresher/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["recommendation"])
+
+    def test_recommends_the_sop_with_the_most_of_the_learners_own_wrong_answers(self):
+        attempt = QuizAttempt.objects.create(learner=self.learner, job_role=self.role, sop=self.sop, score=0)
+        AttemptAnswer.objects.create(attempt=attempt, question=self.question, is_correct=False)
+        AttemptAnswer.objects.create(attempt=attempt, question=self.question, is_correct=False)
+
+        # A different learner's wrong answers must not influence this learner's recommendation.
+        other_attempt = QuizAttempt.objects.create(learner=self.other_learner, job_role=self.role, sop=self.sop, score=0)
+        AttemptAnswer.objects.create(attempt=other_attempt, question=self.question, is_correct=False)
+
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/analytics/recommended-refresher/")
+        self.assertEqual(response.status_code, 200)
+        recommendation = response.data["recommendation"]
+        self.assertIsNotNone(recommendation)
+        self.assertEqual(recommendation["sop_id"], self.sop.id)
+        self.assertEqual(recommendation["job_role_id"], self.role.id)
+        self.assertEqual(recommendation["wrong_count"], 2)
+
+    def test_requires_authentication(self):
+        response = self.client.get("/api/analytics/recommended-refresher/")
+        self.assertEqual(response.status_code, 401)

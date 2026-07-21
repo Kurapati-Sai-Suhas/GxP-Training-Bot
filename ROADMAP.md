@@ -77,12 +77,34 @@ Everything the Day 1–3 "what's left" list called out as future work, closed fo
 
 ---
 
+## Day 5 — Literature-grounded gap closure ahead of Review-1 — ✅ DONE
+
+Scope: close the highest-value remaining gaps from Day 4's "what's left" list, each additive (no changes to existing behavior or architecture), grounded in a literature pass rather than guessed at, and independently verified live (not just by the test suite).
+
+- [x] **5.1 Literature review** — searched for research directly relevant to this project's design and its named gaps, across LLM-based MCQ/distractor generation, RAG for regulatory/compliance domains, adaptive/weak-topic retraining, GxP-specific LLM use, chunking-strategy evaluation, and hallucination mitigation. 15 sources (arXiv, NeurIPS, a peer-reviewed medical-education systematic review, ISPE Pharmaceutical Engineering, and two medRxiv preprints) mapped to specific project decisions and gaps — full list and a synthesis paragraph kept alongside the Review-1 deck notes. Two findings directly validated existing choices rather than just motivating new work: a 2026 systematic review of 71 studies found ungated AI-generated MCQs run up to 45% factual-error rates, backing the project's mandatory SME-approval gate; and two independent 2026 chunking studies found semantic/embeddings chunking doesn't reliably beat structure-aware chunking on structured technical documents, backing the existing heading-aware chunker as a considered trade-off rather than a shortcut.
+- [x] **5.2 Electronic signatures (21 CFR Part 11 parity)** — `quiz/views.py`'s `approve`/`reject` actions now require the reviewer's own password in the request body, verified via `request.user.check_password()`; a missing or wrong password returns 400 and leaves the question's status untouched. Audit log entries for these actions now carry `details.e_signature = true`. Frontend: a confirmation modal on Question Review collects the password before calling the API. This was the single most-cited remaining gap across the SRS's Sections 5.3, 9.1, 11.2, and DEMO_SCRIPT's judge-question table.
+- [x] **5.3 AI-drafted question confidence scoring** — the generation prompt now asks NVIDIA NIM for a `confidence` (0.0–1.0) estimate per question alongside the existing fields; the offline mock generator reports 1.0 (its correct answer is copied verbatim from the SOP by construction, not a guess). Stored on `Question.confidence_score` (new nullable field, migration `quiz/0002`), surfaced as a color-coded badge in Question Review so review effort concentrates on the drafts the model was least sure about — directly informed by the literature's finding that AI-generated distractors are "less adept at anticipating... misconceptions" than human-authored ones.
+- [x] **5.4 Server-side SOP upload validation** — `sops/serializers.py` now rejects an unsupported file extension or a file over 20MB at upload time (400), instead of only the frontend's `<input accept=...>` constraining this. Closes a named Section 11.1 gap.
+- [x] **5.5 NVIDIA NIM retry with backoff** — `generate_questions_with_nvidia_nim()` now retries a transient failure up to 3 attempts (linear backoff) before the caller falls back to the offline generator, instead of falling back on the very first hiccup. Closes a named Section 9.2 gap.
+- [x] **5.6 Audit trail CSV export** — `GET /api/audit/logs/export/` (Admin only) streams the trail as CSV; an "Export Audit Log" button on the Dashboard (Admin only) triggers a real browser download. Closes part of the Section 11.2 "exportable compliance reports" gap (JSON-only before).
+- [x] **5.7 Adaptive-retraining recommendation** — `GET /api/analytics/recommended-refresher/` finds the SOP the requesting learner has personally answered incorrectly most often across their own past attempts and returns it as a suggestion; the Learner Quiz screen shows it as a "Recommended Refresher" card with a one-click "select this SOP" action. This is a recommendation the learner still acts on themselves, not an auto-assigned quiz — a real step toward the Section 16.1 "adaptive retraining" future-scope item, honestly scoped as partial.
+- [x] **5.8 Full regression pass** — all 5.2–5.7 additions are covered by new tests (10 new backend tests, 45 total, all passing) and were also exercised live in the browser against the real dev database, not just the test suite.
+
+**Bugs found and fixed while verifying this live (pre-existing, not introduced today):**
+1. **Real bug:** the Dashboard's initial data-loading `useEffect` in `frontend/src/App.jsx` had an empty dependency array, so it only ever fetched real backend data once, on first page mount — before login, when there's no auth token yet. Logging in via the SPA (without a full page reload) left the Dashboard permanently showing hardcoded fallback/demo numbers instead of real data, even though the user was now authenticated; only a hard reload (which re-mounts and finds the now-stored token) showed real numbers. Fixed by depending the effect on `currentUser` so it re-fetches after login/logout.
+2. **Real bug:** `OptionList` in `App.jsx` keyed its rendered options on the option text itself (`key={option}`). Several AI-generated questions have two options with identical text (a duplicate distractor), which produced a React "two children with the same key" warning and put React's list-diffing behavior for that question card in undefined territory. Fixed by keying on `index` instead.
+3. **Not a bug, an operational step:** the new `confidence_score` migration had to be applied to the real dev SQLite database (`manage.py migrate`), separately from the test suite (which builds its own fresh DB from migrations automatically) — the running dev server 500'd on `/api/quiz/questions/` until this was run. Recorded here since it's exactly the kind of step that's easy to forget between "tests pass" and "the actual demo database works."
+
+**End of Day 5 checkpoint:** every Day-4 "what's left" item except embeddings-based chunking, full auto-assigned adaptive retraining, a RAG-based SOP chatbot, and the frontend test suite is now closed, literature-grounded, and verified live end-to-end (login → approve-with-signature → CSV export → learner sees a real recommendation), not just written. ✅ Confirmed working.
+
+---
+
 ## What's left (genuinely out of scope, not just deferred busywork)
 
-- Electronic signatures (re-authentication at the point of approval) — the audit trail itself is done, e-signature capture is a further step for full 21 CFR Part 11 parity
-- Embeddings-based/vector-search chunking (the chunker is heading-aware now, but not semantic/embedding-based)
-- Adaptive retraining (auto-assigning a targeted quiz off the weak-topics data, rather than just surfacing it)
-- Frontend test suite (backend has 35 tests; frontend has none)
+- Embeddings-based/vector-search chunking (the chunker is heading-aware, and Day 5's literature review found this is a defensible trade-off on structured documents, not just a shortcut — still worth trying)
+- RAG-based free-text SOP Q&A for learners (a natural next AI-layer feature, not yet built)
+- Full adaptive retraining (auto-*assigning* a targeted quiz off weak-topic data — Day 5 added the recommendation half of this, not the auto-assignment)
+- Frontend test suite (backend has 45 tests; frontend has none)
 - Committing `frontend/package-lock.json` (currently gitignored) so CI can use `npm ci` instead of `npm install`
 
 These are captured in `docs/SRS_GxP_Training_Bot.docx` Section 9 as the real remaining "future work" list, and `DEMO_SCRIPT.md`'s judge-question table covers how to talk about them live.

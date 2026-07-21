@@ -8,6 +8,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from .models import SOPChunk, SOPDocument
+from .serializers import MAX_SOP_FILE_SIZE_BYTES
 from .services import chunk_text
 
 SOP_TEXT = (
@@ -87,23 +88,59 @@ class SopProcessTests(APITestCase):
         self.assertIn("Section 1: Purpose", titles)
         self.assertIn("Section 2: Sequence", titles)
 
-    def test_process_unsupported_file_type_marks_sop_failed(self):
-        upload = SimpleUploadedFile("sop.xyz", b"not a real document", content_type="application/octet-stream")
+    def test_process_corrupted_file_marks_sop_failed(self):
+        """A file with an allowed extension (.pdf) that isn't actually a valid PDF passes
+        upload-time validation (extension + size only) but fails at extraction time —
+        the SOP should end up 'failed', not silently stuck or crashing the request."""
+        upload = SimpleUploadedFile("sop.pdf", b"not a real pdf binary", content_type="application/pdf")
         create_response = self.client.post(
             "/api/sops/documents/",
             {
-                "title": "Bad Format SOP",
+                "title": "Corrupted SOP",
                 "sop_code": "SOP-901",
                 "version": "v1.0",
                 "department": "Production",
                 "file": upload,
             },
         )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED)
         sop_id = create_response.data["id"]
 
         process_response = self.client.post(f"/api/sops/documents/{sop_id}/process/")
         self.assertEqual(process_response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(SOPDocument.objects.get(id=sop_id).status, "failed")
+
+    def test_upload_rejected_for_unsupported_extension(self):
+        upload = SimpleUploadedFile("sop.xyz", b"not a real document", content_type="application/octet-stream")
+        response = self.client.post(
+            "/api/sops/documents/",
+            {
+                "title": "Bad Format SOP",
+                "sop_code": "SOP-902",
+                "version": "v1.0",
+                "department": "Production",
+                "file": upload,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(SOPDocument.objects.filter(sop_code="SOP-902").exists())
+
+    def test_upload_rejected_for_oversized_file(self):
+        oversized = SimpleUploadedFile(
+            "sop.txt", b"a" * (MAX_SOP_FILE_SIZE_BYTES + 1), content_type="text/plain"
+        )
+        response = self.client.post(
+            "/api/sops/documents/",
+            {
+                "title": "Too Big SOP",
+                "sop_code": "SOP-903",
+                "version": "v1.0",
+                "department": "Production",
+                "file": oversized,
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(SOPDocument.objects.filter(sop_code="SOP-903").exists())
 
 
 class ChunkTextTests(SimpleTestCase):

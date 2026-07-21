@@ -33,10 +33,11 @@ async function request(path) {
   return response.json();
 }
 
-async function patch(path) {
+async function patch(path, body) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: "PATCH",
     headers: authHeaders({ "Content-Type": "application/json" }),
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!response.ok) {
     await parseErrorAndThrow(response, path);
@@ -90,6 +91,10 @@ export async function getDashboardSummary() {
   return request("/analytics/dashboard-summary/");
 }
 
+export async function getRecommendedRefresher() {
+  return request("/analytics/recommended-refresher/");
+}
+
 export async function getSopDocuments() {
   return request("/sops/documents/");
 }
@@ -110,12 +115,28 @@ export async function getLearnerProfiles() {
   return request("/accounts/learner-profiles/");
 }
 
-export async function approveQuestion(id) {
-  return patch(`/quiz/questions/${id}/approve/`);
+export async function approveQuestion(id, password) {
+  return patch(`/quiz/questions/${id}/approve/`, { password });
 }
 
-export async function rejectQuestion(id) {
-  return patch(`/quiz/questions/${id}/reject/`);
+export async function rejectQuestion(id, password) {
+  return patch(`/quiz/questions/${id}/reject/`, { password });
+}
+
+export async function downloadAuditLogCsv() {
+  const response = await fetch(`${API_BASE_URL}/audit/logs/export/`, { headers: authHeaders() });
+  if (!response.ok) {
+    await parseErrorAndThrow(response, "/audit/logs/export/");
+  }
+  const blob = await response.blob();
+  const url = window.URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `gxp-audit-log-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(url);
 }
 
 export async function createSopDocument(formData) {

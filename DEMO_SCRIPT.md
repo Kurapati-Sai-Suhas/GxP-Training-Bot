@@ -19,7 +19,7 @@ A literal, rehearsable walkthrough. Follow it in order; don't improvise on stage
 
 ### 2. Log in as the QA/Admin (`anjali` / `demo12345`)
 
-Show the Dashboard: real counts (SOPs processed, questions approved, learner attempts, average score) — say explicitly "this is live data from our Django backend, not a mockup."
+Show the Dashboard: real counts (SOPs processed, questions approved, learner attempts, average score) — say explicitly "this is live data from our Django backend, not a mockup." Point out the **Export Audit Log** button (Admin only) — click it to show a real CSV download of the compliance trail.
 
 ### 3. Upload a real SOP (SOP Library)
 
@@ -34,9 +34,9 @@ Show the Dashboard: real counts (SOPs processed, questions approved, learner att
 
 ### 5. Review and approve (Question Review)
 
-- Show a question card: options, the highlighted correct answer, and — this is the PS053 core requirement — the **explanation**, which states why the correct answer is compliant and why the others are risky.
-- Click **Approve** on one, **Reject** on another, to show the human-in-the-loop QA gate before anything reaches a learner.
-- **Optional role-boundary beat:** log out, log in as `vikram` (SME Reviewer). Point out the sidebar — Generate Quiz and SOP upload are gone, but Question Review is still there, and Approve/Reject still work. "This account can review, but can't upload or generate — that's enforced on the backend too, not just hidden in the UI."
+- Show a question card: options, the highlighted correct answer, a **confidence badge** (say: "this is the model's own estimate of how sure it was — low-confidence drafts are the ones we want a human looking at hardest"), and — this is the PS053 core requirement — the **explanation**, which states why the correct answer is compliant and why the others are risky.
+- Click **Approve** on one. A password-confirmation modal appears — "**Confirm Electronic Signature**." Say: "this is our 21 CFR Part 11 electronic signature — approving isn't just a click, it's a re-authenticated, audit-logged decision." Enter the password and confirm. Click **Reject** on another the same way, to show the human-in-the-loop QA gate before anything reaches a learner.
+- **Optional role-boundary beat:** log out, log in as `vikram` (SME Reviewer). Point out the sidebar — Generate Quiz and SOP upload are gone, but Question Review is still there, and Approve/Reject still work (with the same signature prompt). "This account can review, but can't upload or generate — that's enforced on the backend too, not just hidden in the UI."
 
 ### 6. Log out, log in as a learner (`rohit` / `demo12345`)
 
@@ -44,6 +44,7 @@ Show the Dashboard: real counts (SOPs processed, questions approved, learner att
 
 ### 7. Take the quiz (Learner Quiz)
 
+- If a **Recommended Refresher** card is showing, point it out first: "this is computed from this learner's own past wrong answers — a real adaptive-retraining signal, not a static suggestion."
 - Pick the SOP quiz you just approved questions for, click **Start Quiz**.
 - Answer through it — **deliberately get one wrong** so you can show the payoff feature.
 - Submit. On the result screen, show: the score, and for the wrong answer specifically, "your answer / correct answer / explanation" — this is the "explains wrong answers" requirement from PS053, working end-to-end from a real backend scoring call.
@@ -68,10 +69,11 @@ Show the Dashboard: real counts (SOPs processed, questions approved, learner att
 | Question | Answer |
 |---|---|
 | "Is this using a real LLM?" | Yes — NVIDIA NIM's hosted `meta/llama-3.1-8b-instruct`, OpenAI-compatible API. There's also a deterministic offline fallback so a demo never depends on network access. |
-| "Is this secure enough for real employee data?" | We have token auth, three role tiers (Admin / SME Reviewer / Learner) enforced on both the API and UI, ownership checks on quiz attempts, and an append-only audit log of every approve/reject/upload/generate/submit action. What's not done yet is electronic signatures (re-authentication at the point of approval), which is the remaining piece for full 21 CFR Part 11 parity. |
-| "Does it scale to big SOPs?" | The chunker splits on detected section headings rather than blind character cuts, and both SOP processing and AI generation run as Celery tasks — synchronous by default for simple local dev, genuinely async against Redis when deployed (verified via Docker). A semantic/embeddings-based chunker is the next step for very large or unstructured documents. |
-| "Do you have tests?" | Yes — 35 backend tests (accounts, sops, ai_engine, quiz, attempts, analytics, audit), including RBAC boundary tests per role, a forced offline-fallback path for AI generation so tests never need a live API key, and regression tests for real bugs we found and fixed during development. CI runs the suite against a real Postgres service container. |
+| "Is this secure enough for real employee data?" | We have token auth, three role tiers (Admin / SME Reviewer / Learner) enforced on both the API and UI, ownership checks on quiz attempts, an append-only audit log of every approve/reject/upload/generate/submit action, and — as of Day 5 — an electronic signature (password re-entry) required at the exact point a question is approved or rejected, the piece that was previously the main gap for full 21 CFR Part 11 parity. |
+| "Does it scale to big SOPs?" | The chunker splits on detected section headings rather than blind character cuts, and both SOP processing and AI generation run as Celery tasks — synchronous by default for simple local dev, genuinely async against Redis when deployed (verified via Docker). A literature review of chunking-strategy studies on structured technical documents found semantic/embeddings chunking doesn't reliably beat structure-aware chunking, so the current approach is a considered trade-off, not a shortcut — still a candidate for very large or unstructured documents. |
+| "Do you have tests?" | Yes — 45 backend tests (accounts, sops, ai_engine, quiz, attempts, analytics, audit), including RBAC boundary tests per role, electronic-signature boundary tests, a forced offline-fallback path for AI generation so tests never need a live API key, and regression tests for real bugs we found and fixed during development. CI runs the suite against a real Postgres service container. |
 | "Does this run in Docker / is it production-deployable?" | Yes — `docker compose up --build` brings up Postgres, Redis, the Django backend, a Celery worker, and the frontend behind nginx. We ran the full stack this way and generated a real quiz through it end to end, including watching the Celery worker's own log show the NVIDIA NIM call happening inside the worker process. |
+| "Is any of this grounded in research, or just built from intuition?" | We did a literature pass across LLM-based MCQ/distractor generation, RAG for regulatory domains, adaptive retraining, and chunking-strategy evaluation (15 sources). Two findings directly validated existing design choices: a 2026 systematic review found ungated AI-generated MCQs can have factual-error rates up to 45%, which is the evidence base for our mandatory SME-approval gate; and independent 2026 chunking studies found semantic chunking doesn't reliably beat our heading-aware approach on structured documents like SOPs. |
 
 ---
 

@@ -52,15 +52,46 @@ class QuestionWorkflowTests(APITestCase):
 
     def test_approve_succeeds_for_sme_reviewer(self):
         self.client.force_authenticate(user=self.reviewer)
-        response = self.client.patch(f"/api/quiz/questions/{self.draft_question.id}/approve/")
+        response = self.client.patch(
+            f"/api/quiz/questions/{self.draft_question.id}/approve/", {"password": "demo12345"}, format="json"
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.draft_question.refresh_from_db()
         self.assertEqual(self.draft_question.status, "approved")
 
     def test_approve_succeeds_for_admin(self):
         self.client.force_authenticate(user=self.admin)
-        response = self.client.patch(f"/api/quiz/questions/{self.draft_question.id}/approve/")
+        response = self.client.patch(
+            f"/api/quiz/questions/{self.draft_question.id}/approve/", {"password": "demo12345"}, format="json"
+        )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_approve_rejected_without_e_signature_password(self):
+        """21 CFR Part 11: approving requires re-confirming the reviewer's own password,
+        not just an already-authenticated session/token."""
+        self.client.force_authenticate(user=self.reviewer)
+        response = self.client.patch(f"/api/quiz/questions/{self.draft_question.id}/approve/")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft_question.refresh_from_db()
+        self.assertEqual(self.draft_question.status, "draft")
+
+    def test_approve_rejected_for_wrong_e_signature_password(self):
+        self.client.force_authenticate(user=self.reviewer)
+        response = self.client.patch(
+            f"/api/quiz/questions/{self.draft_question.id}/approve/", {"password": "wrong-password"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft_question.refresh_from_db()
+        self.assertEqual(self.draft_question.status, "draft")
+
+    def test_reject_succeeds_with_e_signature_password(self):
+        self.client.force_authenticate(user=self.reviewer)
+        response = self.client.patch(
+            f"/api/quiz/questions/{self.approved_question.id}/reject/", {"password": "demo12345"}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.approved_question.refresh_from_db()
+        self.assertEqual(self.approved_question.status, "rejected")
 
     def test_sme_reviewer_cannot_create_raw_questions(self):
         """RBAC: approving is an SME action, but directly creating/editing a Question is Admin-only."""

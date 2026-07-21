@@ -31,6 +31,7 @@ class QuestionSerializer(serializers.ModelSerializer):
             "difficulty",
             "explanation",
             "status",
+            "confidence_score",
             "created_at",
             "options",
         ]

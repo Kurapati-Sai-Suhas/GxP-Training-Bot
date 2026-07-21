@@ -1,6 +1,6 @@
 # GxP Training Bot
 
-GxP Training Bot is a full-stack capstone project (NVIDIA GenAI Bootcamp, PS053 — Pharma & Life Sciences) for SOP-based training. A Training/QA Admin uploads an SOP document, the app extracts and chunks its text along section-heading boundaries, NVIDIA NIM (with a deterministic offline fallback) drafts role-specific multiple-choice questions with compliance explanations, an SME/QA Reviewer approves or rejects each draft, and learners take the approved quiz and get immediate score + explanation feedback on any wrong answer. Every write action is attributed to a role-checked user and recorded in an append-only audit trail.
+GxP Training Bot is a full-stack capstone project (NVIDIA GenAI Bootcamp, PS053 — Pharma & Life Sciences) for SOP-based training. A Training/QA Admin uploads an SOP document, the app extracts and chunks its text along section-heading boundaries, NVIDIA NIM (with a deterministic offline fallback) drafts role-specific multiple-choice questions with compliance explanations and a self-reported confidence score, an SME/QA Reviewer approves or rejects each draft under an electronic signature (password re-entry), and learners take the approved quiz and get immediate score + explanation feedback on any wrong answer, plus a recommended-refresher suggestion targeted at their own weak topics. Every write action is attributed to a role-checked user and recorded in an append-only audit trail, exportable as CSV.
 
 See [`docs/SRS_GxP_Training_Bot.docx`](docs/SRS_GxP_Training_Bot.docx) for the full requirements spec, [`ROADMAP.md`](ROADMAP.md) for the day-by-day build log, and [`DEMO_SCRIPT.md`](DEMO_SCRIPT.md) for a rehearsable walkthrough.
 
@@ -11,8 +11,8 @@ See [`docs/SRS_GxP_Training_Bot.docx`](docs/SRS_GxP_Training_Bot.docx) for the f
 - Database: SQLite for local dev; PostgreSQL verified via Docker (`docker-compose.yml`)
 - Async processing: Celery + Redis, verified via Docker; defaults to synchronous/eager execution when no broker is configured, so local dev needs nothing extra
 - Document processing: PyMuPDF, python-docx; heading-aware chunker (splits on detected section headings, falls back to length-based splitting)
-- AI layer: NVIDIA NIM (OpenAI-compatible API, `meta/llama-3.1-8b-instruct`), with a deterministic offline fallback generator and duplicate-question detection
-- Compliance: append-only `AuditLog` (21 CFR Part 11 style) for uploads, processing, generation, approve/reject, and quiz submission
+- AI layer: NVIDIA NIM (OpenAI-compatible API, `meta/llama-3.1-8b-instruct`), with retry-with-backoff on transient failures, a deterministic offline fallback generator, duplicate-question detection, and a per-question confidence score
+- Compliance: append-only `AuditLog` (21 CFR Part 11 style, CSV-exportable) for uploads, processing, generation, approve/reject, and quiz submission; approve/reject additionally requires an electronic signature (password re-entry)
 - CI: GitHub Actions (`.github/workflows/ci.yml`) — backend tests against real Postgres, frontend build
 - Containerization: Docker Compose (backend, celery-worker, frontend/nginx, postgres, redis) — see `docker-compose.yml`
 
@@ -70,19 +70,23 @@ Main API groups:
 /api/accounts/me/                             GET   (auth required)
 /api/accounts/job-roles/                      writes: Admin only
 /api/accounts/learner-profiles/                writes: Admin only
-/api/sops/documents/                          writes: Admin only
+/api/sops/documents/                          writes: Admin only; file validated server-side (type allowlist + 20MB cap)
 /api/sops/documents/{id}/process/             POST  Admin only
 /api/ai_engine/generate/                      POST  Admin only  {sop, job_role, count, difficulty}
-/api/quiz/questions/                          supports ?sop=&job_role=&status= filters
-/api/quiz/questions/{id}/approve/             PATCH Admin or SME Reviewer
-/api/quiz/questions/{id}/reject/              PATCH Admin or SME Reviewer
+/api/quiz/questions/                          supports ?sop=&job_role=&status= filters; includes confidence_score
+/api/quiz/questions/{id}/approve/             PATCH Admin or SME Reviewer, requires {password} (electronic signature)
+/api/quiz/questions/{id}/reject/              PATCH Admin or SME Reviewer, requires {password} (electronic signature)
 /api/attempts/quiz-attempts/                  POST  (auth required) {sop, job_role}; list scoped to own attempts unless Admin
 /api/attempts/quiz-attempts/{id}/submit/      POST  (auth required, owner only)
 /api/analytics/dashboard-summary/             GET   (auth required) incl. weak_topics
+/api/analytics/recommended-refresher/         GET   (auth required) per-learner adaptive-retraining suggestion
 /api/audit/logs/                              GET   Admin only — the compliance audit trail (also viewable at /admin/)
+/api/audit/logs/export/                       GET   Admin only — CSV export of the audit trail
 ```
 
 Reads generally require only authentication; the actions above marked "Admin only" / "Admin or SME Reviewer" additionally require the matching Django Group (or `is_staff`) — see **Roles** below. Attempt/answer *reads* are also row-scoped: a plain learner only ever sees their own attempts, Admins see everyone's.
+
+Approving or rejecting a question is a 21 CFR Part 11-style electronic signature: the reviewer must re-submit their own password in the request body (`{"password": "..."}`), verified server-side via `check_password()`, not just rely on an already-authenticated session. A missing or wrong password returns `400` and the question's status is left unchanged; a successful signature is recorded in the audit log entry (`details.e_signature = true`). The frontend prompts for this via a confirmation modal on Question Review.
 
 ### Roles
 
@@ -121,16 +125,18 @@ cd backend
 uv run python manage.py test
 ```
 
-35 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation (no live API key needed to run tests), and two regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
+45 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation (no live API key needed to run tests), electronic-signature boundary tests (missing/wrong password on approve/reject), and regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
 
 ## Current Scope
 
 - SOP upload (real form, multipart) → text extraction → heading-aware chunking, fully wired end to end
-- AI quiz generation via NVIDIA NIM per SOP chunk, with an offline fallback generator and duplicate-question detection, wired into the Generate Quiz screen with a live/offline badge
-- Question approval/rejection workflow, backend + UI, gated to Admin/SME Reviewer
+- Server-side SOP upload validation: file-extension allowlist (`.pdf/.docx/.txt/.md`) and a 20MB size cap, enforced in the serializer, not just the frontend's `<input accept=...>`
+- AI quiz generation via NVIDIA NIM per SOP chunk, with a retry-with-backoff on transient failures, an offline fallback generator, and duplicate-question detection, wired into the Generate Quiz screen with a live/offline badge
+- Each AI-drafted question carries a self-reported `confidence_score` (0.0–1.0), surfaced as a badge in Question Review so reviewer attention concentrates on the drafts the model was least sure about
+- Question approval/rejection workflow, backend + UI, gated to Admin/SME Reviewer, and now requires an electronic signature (password re-entry) at the point of approval/rejection — the audit log records `e_signature: true` on each such entry
 - Token-based auth with three role tiers (Admin / SME Reviewer / Learner), enforced on both the API and the UI
-- Append-only audit trail for every write action (also visible via Django admin, read-only)
-- Learner Quiz: real approved-question fetch (scoped to the learner's role), real `QuizAttempt` creation, real scoring + per-question explanations on submit
+- Append-only audit trail for every write action, an Admin-only CSV export of the trail (`/api/audit/logs/export/`, also a button on the Dashboard), and read access via Django admin
+- Learner Quiz: real approved-question fetch (scoped to the learner's role), real `QuizAttempt` creation, real scoring + per-question explanations on submit, plus a "Recommended Refresher" card suggesting a retake of the SOP the learner has personally missed the most questions on (adaptive retraining, recommendation-only — the learner still starts it themselves)
 - Analytics (incl. weak topics by correct-rate) and Users & Roles pages bound to real backend data
 - Celery + Redis for async SOP processing / AI generation, and PostgreSQL support, both verified via Docker
 - Dockerfiles + `docker-compose.yml` for the full stack; GitHub Actions CI running tests + build
@@ -139,8 +145,8 @@ uv run python manage.py test
 
 See `ROADMAP.md` and Section 9 of the SRS for the full list. What's genuinely still open:
 
-- Electronic signatures (re-authentication on approval) for full 21 CFR Part 11 parity — the audit trail itself is implemented, e-signature capture is not
-- Embeddings-based/vector-search chunking (the current chunker is heading-aware but not semantic)
-- Adaptive retraining (auto-assigning a targeted quiz based on weak-topic data)
-- Frontend test suite (backend has 35 tests; frontend has none yet)
+- Embeddings-based/vector-search chunking (the current chunker is heading-aware but not semantic) — two independent 2026 chunking-strategy studies on structured technical documents found semantic chunking didn't reliably outperform structure-aware chunking, so this is treated as a worthwhile experiment rather than an urgent fix (see `ROADMAP.md` Day 5 literature notes)
+- Full adaptive retraining (auto-*assigning* a targeted quiz, not just recommending one) — the recommendation surfaced now is a real step toward this, not the whole thing
+- RAG-based free-text SOP Q&A (a learner asking an open question about an SOP, grounded in its chunks) — named as the natural next AI-layer extension
+- Frontend test suite (backend has 45 tests; frontend has none yet)
 - `frontend/package-lock.json` is gitignored, so CI uses `npm install` instead of `npm ci` — committing the lockfile would make builds reproducible
