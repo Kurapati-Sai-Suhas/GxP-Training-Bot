@@ -1,10 +1,13 @@
 from django.utils import timezone
 from rest_framework import decorators, permissions, response, viewsets
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
 
 from accounts.permissions import ADMIN_GROUP
 from audit.models import log_action
+from quiz.models import Question
 
-from .models import AttemptAnswer, QuizAttempt
+from .models import AttemptAnswer, QuizAttempt, TopicMastery
 from .serializers import AttemptAnswerSerializer, QuizAttemptSerializer
 
 
@@ -80,3 +83,55 @@ class AttemptAnswerViewSet(viewsets.ReadOnlyModelViewSet):
         if _is_admin(self.request.user):
             return queryset
         return queryset.filter(attempt__learner=self.request.user)
+
+
+@api_view(["GET"])
+@permission_classes([permissions.IsAuthenticated])
+def auto_assigned_retraining(request):
+    """Adaptive-retraining auto-assignment (soft): for the requesting learner, find every
+    SOP whose TopicMastery schedule (Leitner-style box scheduling, see models.py) says a
+    retest is now due and not yet mastered, and describe it as an assignment with a
+    difficulty-matched suggestion. This only reads state kept up to date by the
+    AttemptAnswer signal (signals.py) — it does not create a QuizAttempt itself; the
+    learner still starts one via the existing POST /api/attempts/quiz-attempts/ endpoint,
+    exactly as they do for any other quiz today."""
+    due = (
+        TopicMastery.objects.filter(learner=request.user, next_eligible_at__lte=timezone.now())
+        .exclude(mastery_status="mastered")
+        .select_related("sop", "job_role")
+    )
+
+    assignments = []
+    for mastery in due:
+        if mastery.streak_correct == 0:
+            suggested_difficulty = "easy"
+        elif mastery.streak_correct < TopicMastery.MASTERY_STREAK_THRESHOLD - 1:
+            suggested_difficulty = "medium"
+        else:
+            suggested_difficulty = "hard"
+
+        available_count = Question.objects.filter(
+            sop=mastery.sop, job_role=mastery.job_role, status="approved"
+        ).count()
+        if available_count == 0:
+            continue
+
+        assignments.append(
+            {
+                "sop_id": mastery.sop_id,
+                "sop_code": mastery.sop.sop_code,
+                "sop_title": mastery.sop.title,
+                "job_role_id": mastery.job_role_id,
+                "box_index": mastery.box_index,
+                "streak_correct": mastery.streak_correct,
+                "due_since": mastery.next_eligible_at.isoformat(),
+                "suggested_difficulty": suggested_difficulty,
+                "question_count_available": available_count,
+                "reason": (
+                    f"Due for a spaced retest (box {mastery.box_index}) under our adaptive-retraining "
+                    f"schedule — {mastery.streak_correct} correct in a row so far on this SOP."
+                ),
+            }
+        )
+
+    return Response({"assignments": assignments})

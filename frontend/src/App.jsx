@@ -39,6 +39,7 @@ import {
   downloadAuditLogCsv,
   generateQuiz,
   getApprovedQuestionsForRole,
+  getAutoAssignedRetraining,
   getDashboardSummary,
   getJobRoles,
   getLearnerProfiles,
@@ -891,6 +892,7 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState(null);
   const [recommendation, setRecommendation] = useState(null);
+  const [autoAssignments, setAutoAssignments] = useState([]);
 
   useEffect(() => {
     if (!jobRole) {
@@ -905,6 +907,15 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
       })
       .catch(() => {
         // Purely a nice-to-have suggestion; a failure here shouldn't block the quiz flow.
+      });
+    getAutoAssignedRetraining()
+      .then((data) => {
+        if (!cancelled) {
+          setAutoAssignments(data.assignments || []);
+        }
+      })
+      .catch(() => {
+        // Same as above: a failed fetch here just means no assignments show, not a hard error.
       });
     return () => {
       cancelled = true;
@@ -1086,9 +1097,29 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
   }
 
   if (!attempt) {
+    const dueAssignments = autoAssignments.filter((item) =>
+      sopGroups.some((group) => String(group.id) === String(item.sop_id))
+    );
     return (
       <div className="page">
         <PageHeader title="Learner Quiz" subtitle={`Approved quizzes available for ${jobRole.name}`} />
+        {dueAssignments.length > 0 && (
+          <section className="card">
+            <div className="card__title">
+              Adaptive Retraining Due <small>Spaced-repetition schedule</small>
+            </div>
+            {dueAssignments.map((item) => (
+              <div className="q-card__source" key={item.sop_id} style={{ marginBottom: "10px" }}>
+                <strong>{item.sop_code}</strong> ({item.sop_title}) — {item.reason}
+                <div className="button-row">
+                  <button className="btn btn--primary" onClick={() => setSopId(String(item.sop_id))} type="button">
+                    <RefreshCw size={14} /> Start {item.sop_code} Retraining
+                  </button>
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
         {recommendation && sopGroups.some((group) => String(group.id) === String(recommendation.sop_id)) && (
           <section className="card">
             <div className="card__title">

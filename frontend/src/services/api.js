@@ -95,6 +95,10 @@ export async function getRecommendedRefresher() {
   return request("/analytics/recommended-refresher/");
 }
 
+export async function getAutoAssignedRetraining() {
+  return request("/attempts/auto-assigned/");
+}
+
 export async function getSopDocuments() {
   return request("/sops/documents/");
 }

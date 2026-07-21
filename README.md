@@ -78,8 +78,9 @@ Main API groups:
 /api/quiz/questions/{id}/reject/              PATCH Admin or SME Reviewer, requires {password} (electronic signature)
 /api/attempts/quiz-attempts/                  POST  (auth required) {sop, job_role}; list scoped to own attempts unless Admin
 /api/attempts/quiz-attempts/{id}/submit/      POST  (auth required, owner only)
+/api/attempts/auto-assigned/                  GET   (auth required) per-learner adaptive-retraining schedule (due topics)
 /api/analytics/dashboard-summary/             GET   (auth required) incl. weak_topics
-/api/analytics/recommended-refresher/         GET   (auth required) per-learner adaptive-retraining suggestion
+/api/analytics/recommended-refresher/         GET   (auth required) per-learner "most personally missed SOP" suggestion
 /api/audit/logs/                              GET   Admin only — the compliance audit trail (also viewable at /admin/)
 /api/audit/logs/export/                       GET   Admin only — CSV export of the audit trail
 ```
@@ -87,6 +88,8 @@ Main API groups:
 Reads generally require only authentication; the actions above marked "Admin only" / "Admin or SME Reviewer" additionally require the matching Django Group (or `is_staff`) — see **Roles** below. Attempt/answer *reads* are also row-scoped: a plain learner only ever sees their own attempts, Admins see everyone's.
 
 Approving or rejecting a question is a 21 CFR Part 11-style electronic signature: the reviewer must re-submit their own password in the request body (`{"password": "..."}`), verified server-side via `check_password()`, not just rely on an already-authenticated session. A missing or wrong password returns `400` and the question's status is left unchanged; a successful signature is recorded in the audit log entry (`details.e_signature = true`). The frontend prompts for this via a confirmation modal on Question Review.
+
+**Adaptive retraining** — `attempts/models.py TopicMastery` tracks one row per (learner, SOP): a Leitner-style expanding-interval scheduler (correct answer → longer interval before re-test; wrong answer → resets to a 1-day interval) plus a streak-based mastery threshold (3 correct in a row with no intervening miss → `mastered`, at which point it stops being surfaced). It's kept up to date by a `post_save` signal on `AttemptAnswer` (`attempts/signals.py`) — no existing view or serializer was modified to add this. `GET /api/attempts/auto-assigned/` reads that state live and returns every SOP currently due for the requesting learner, each with a difficulty-matched suggestion drawn from the existing `Question.difficulty` field. This is a **soft assignment**: the endpoint never creates a `QuizAttempt` itself — the Learner Quiz screen surfaces due topics prominently, and the learner still starts the quiz through the exact same `POST /api/attempts/quiz-attempts/` flow used for any other quiz. The scheduling design was a deliberate choice among several knowledge-tracing/spaced-repetition approaches from the literature (see `ROADMAP.md` Day 6) — Bayesian/deep knowledge tracing and trained spaced-repetition models (BKT, DKT, Half-Life Regression) were explicitly rejected as needing far more response data per skill than this deployment will ever have.
 
 ### Roles
 
@@ -125,7 +128,7 @@ cd backend
 uv run python manage.py test
 ```
 
-45 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation (no live API key needed to run tests), electronic-signature boundary tests (missing/wrong password on approve/reject), and regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
+51 tests across `accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, and `audit` — including RBAC boundary tests per role, a forced-offline-fallback path for AI generation (no live API key needed to run tests), electronic-signature boundary tests (missing/wrong password on approve/reject), adaptive-retraining scheduling tests, and regression tests for real bugs found during development (a stale Django prefetch-cache issue that showed up twice: once in SOP chunk counting, once in quiz-attempt submission). CI (`.github/workflows/ci.yml`) runs this suite against a real Postgres service container.
 
 ## Current Scope
 
@@ -136,7 +139,7 @@ uv run python manage.py test
 - Question approval/rejection workflow, backend + UI, gated to Admin/SME Reviewer, and now requires an electronic signature (password re-entry) at the point of approval/rejection — the audit log records `e_signature: true` on each such entry
 - Token-based auth with three role tiers (Admin / SME Reviewer / Learner), enforced on both the API and the UI
 - Append-only audit trail for every write action, an Admin-only CSV export of the trail (`/api/audit/logs/export/`, also a button on the Dashboard), and read access via Django admin
-- Learner Quiz: real approved-question fetch (scoped to the learner's role), real `QuizAttempt` creation, real scoring + per-question explanations on submit, plus a "Recommended Refresher" card suggesting a retake of the SOP the learner has personally missed the most questions on (adaptive retraining, recommendation-only — the learner still starts it themselves)
+- Learner Quiz: real approved-question fetch (scoped to the learner's role), real `QuizAttempt` creation, real scoring + per-question explanations on submit, a "Recommended Refresher" card (the SOP the learner has personally missed the most, ever), and an **adaptive-retraining "Adaptive Retraining Due" card** driven by a literature-grounded Leitner-style spaced-repetition scheduler (`TopicMastery` model) — both are soft assignments the learner still starts themselves through the normal quiz flow
 - Analytics (incl. weak topics by correct-rate) and Users & Roles pages bound to real backend data
 - Celery + Redis for async SOP processing / AI generation, and PostgreSQL support, both verified via Docker
 - Dockerfiles + `docker-compose.yml` for the full stack; GitHub Actions CI running tests + build
@@ -146,7 +149,7 @@ uv run python manage.py test
 See `ROADMAP.md` and Section 9 of the SRS for the full list. What's genuinely still open:
 
 - Embeddings-based/vector-search chunking (the current chunker is heading-aware but not semantic) — two independent 2026 chunking-strategy studies on structured technical documents found semantic chunking didn't reliably outperform structure-aware chunking, so this is treated as a worthwhile experiment rather than an urgent fix (see `ROADMAP.md` Day 5 literature notes)
-- Full adaptive retraining (auto-*assigning* a targeted quiz, not just recommending one) — the recommendation surfaced now is a real step toward this, not the whole thing
+- Hard auto-assignment (the system pre-creating a live `QuizAttempt` before the learner acts) — deliberately not built; soft assignment (surface it, learner still starts it) was the chosen scope, see `ROADMAP.md` Day 6
 - RAG-based free-text SOP Q&A (a learner asking an open question about an SOP, grounded in its chunks) — named as the natural next AI-layer extension
-- Frontend test suite (backend has 45 tests; frontend has none yet)
+- Frontend test suite (backend has 51 tests; frontend has none yet)
 - `frontend/package-lock.json` is gitignored, so CI uses `npm install` instead of `npm ci` — committing the lockfile would make builds reproducible
