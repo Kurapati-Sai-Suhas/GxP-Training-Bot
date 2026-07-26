@@ -114,3 +114,31 @@ class QuestionWorkflowTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         returned_ids = {item["id"] for item in response.data}
         self.assertEqual(returned_ids, {self.approved_question.id})
+
+
+class QuestionEloSeedTests(APITestCase):
+    """A brand-new question has no answer history yet, so elo_rating (see
+    attempts/services.py) borrows the LLM's one-time difficulty label as a starting
+    point, then drifts from there as real learners answer it."""
+
+    def setUp(self):
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-901", version="v1.0", department="Production",
+            file="sops/sop-901.txt", status="processed",
+        )
+
+    def test_new_question_seeds_elo_from_difficulty_label(self):
+        for difficulty, expected_elo in Question.DIFFICULTY_SEED_ELO.items():
+            question = Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"{difficulty}?", explanation="Because.",
+                difficulty=difficulty,
+            )
+            self.assertEqual(question.elo_rating, expected_elo)
+
+    def test_explicit_elo_rating_is_not_overridden_by_seeding(self):
+        question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q?", explanation="Because.",
+            difficulty="hard", elo_rating=1650,
+        )
+        self.assertEqual(question.elo_rating, 1650)

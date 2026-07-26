@@ -57,6 +57,16 @@ async function postJson(path, body) {
   return response.json();
 }
 
+async function del(path) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    await parseErrorAndThrow(response, path);
+  }
+}
+
 async function postForm(path, formData) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: "POST",
@@ -97,6 +107,10 @@ export async function getRecommendedRefresher() {
 
 export async function getAutoAssignedRetraining() {
   return request("/attempts/auto-assigned/");
+}
+
+export async function getRetrainingStatus() {
+  return request("/attempts/retraining-status/");
 }
 
 export async function getSopDocuments() {
@@ -149,6 +163,14 @@ export async function createSopDocument(formData) {
 
 export async function processSopDocument(id) {
   return postJson(`/sops/documents/${id}/process/`, {});
+}
+
+export async function deleteSopDocument(id) {
+  return del(`/sops/documents/${id}/`);
+}
+
+export async function updateQuestion(id, updates) {
+  return patch(`/quiz/questions/${id}/`, updates);
 }
 
 export async function generateQuiz({ sop, jobRole, count, difficulty }) {

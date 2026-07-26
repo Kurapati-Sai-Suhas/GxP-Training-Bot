@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -146,15 +147,33 @@ class SopProcessTests(APITestCase):
 class ChunkTextTests(SimpleTestCase):
     def test_splits_on_detected_section_headings(self):
         chunks = chunk_text(SOP_TEXT)
-        self.assertEqual([title for title, _ in chunks], ["Section 1: Purpose", "Section 2: Sequence"])
+        self.assertEqual([title for title, _, _ in chunks], ["Section 1: Purpose", "Section 2: Sequence"])
         self.assertIn("mandatory gowning sequence", chunks[0][1])
         self.assertIn("hair cover", chunks[1][1])
+        self.assertTrue(all(strategy == "heading" for _, _, strategy in chunks))
 
-    def test_falls_back_to_length_based_split_when_no_headings(self):
+    @mock.patch.dict("os.environ", {"NVIDIA_API_KEY": ""})
+    def test_falls_back_to_length_based_split_when_no_headings_and_no_api_key(self):
         text = "Just a plain paragraph with no section headings anywhere in it at all."
         chunks = chunk_text(text, max_chars=1000)
         self.assertEqual(len(chunks), 1)
         self.assertIsNone(chunks[0][0])
+        self.assertEqual(chunks[0][2], "fixed_length")
+
+    @mock.patch("sops.services._embed_sentences")
+    def test_falls_back_to_semantic_chunking_when_no_headings_but_api_key_present(self, mock_embed):
+        # Two near-identical directions (dominated by the first coordinate) followed by
+        # two near-identical but different directions (dominated by the second), so
+        # Max-Min similarity chunking should split them into two semantic groups.
+        mock_embed.return_value = [
+            [1.0, 0.0], [0.95, 0.05], [0.0, 1.0], [0.05, 0.95],
+        ]
+        text = "First idea sentence one.\nFirst idea sentence two.\nSecond idea sentence one.\nSecond idea sentence two."
+        chunks = chunk_text(text, max_chars=1000)
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(all(strategy == "semantic" for _, _, strategy in chunks))
+        self.assertIn("First idea", chunks[0][1])
+        self.assertIn("Second idea", chunks[1][1])
 
     def test_splits_an_overlong_section_further(self):
         # A section made of many separate lines (as a real multi-sentence SOP paragraph
@@ -163,7 +182,7 @@ class ChunkTextTests(SimpleTestCase):
         text = f"Section 1: Purpose\n{sentences}"
         chunks = chunk_text(text, max_chars=200)
         self.assertGreater(len(chunks), 1)
-        self.assertTrue(all(title == "Section 1: Purpose" for title, _ in chunks))
+        self.assertTrue(all(title == "Section 1: Purpose" for title, _, _ in chunks))
 
     def test_numeric_headings_are_also_detected(self):
         text = "3.1 Cleaning Verification\nWipe the surface and inspect under UV light for residue."

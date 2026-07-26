@@ -59,6 +59,7 @@ def generate_quiz_task(sop_id, job_role_id, count, user_id=None):
                 explanation=draft["explanation"],
                 status="draft",
                 confidence_score=draft.get("confidence"),
+                generation_source=source,
             )
             options = list(draft["options"])
             correct_index = draft["correct_option_index"]

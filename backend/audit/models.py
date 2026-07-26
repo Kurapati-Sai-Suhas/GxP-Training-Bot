@@ -15,6 +15,8 @@ class AuditLog(models.Model):
         ("question_rejected", "Question Rejected"),
         ("quiz_attempt_submitted", "Quiz Attempt Submitted"),
         ("sop_chat_query", "SOP Chat Query"),
+        ("quiz_attempt_auto_assigned", "Quiz Attempt Auto-Assigned"),
+        ("retraining_escalation", "Retraining Escalation"),
     ]
 
     user = models.ForeignKey(

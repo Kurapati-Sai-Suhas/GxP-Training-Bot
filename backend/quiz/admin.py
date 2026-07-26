@@ -10,7 +10,7 @@ class OptionInline(admin.TabularInline):
 
 @admin.register(Question)
 class QuestionAdmin(admin.ModelAdmin):
-    list_display = ("question_text", "sop", "job_role", "difficulty", "status", "created_at")
+    list_display = ("question_text", "sop", "job_role", "difficulty", "elo_rating", "status", "created_at")
     list_filter = ("status", "difficulty", "job_role")
     search_fields = ("question_text", "explanation", "sop__sop_code")
     inlines = [OptionInline]

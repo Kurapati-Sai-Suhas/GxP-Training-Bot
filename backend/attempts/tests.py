@@ -9,7 +9,9 @@ from accounts.models import JobRole
 from quiz.models import Option, Question
 from sops.models import SOPDocument
 
+from . import fsrs
 from .models import TopicMastery
+from .services import apply_elo_update
 
 
 class QuizAttemptSubmitTests(APITestCase):
@@ -101,6 +103,7 @@ class AdaptiveRetrainingTests(APITestCase):
     def setUp(self):
         self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
         self.other_learner = get_user_model().objects.create_user(username="priya", password="demo12345")
+        self.admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
         self.role = JobRole.objects.create(name="Production Operator", department="Production")
         self.sop = SOPDocument.objects.create(
             title="Cleanroom Entry", sop_code="SOP-900", version="v1.0", department="Production",
@@ -128,19 +131,39 @@ class AdaptiveRetrainingTests(APITestCase):
         return response.data["id"]
 
     def test_topic_mastery_created_and_advances_on_correct_answers(self):
-        """Three correct answers in a row (the MASTERY_STREAK_THRESHOLD) should flip the
-        topic to mastered and push the next-eligible date out via Leitner box scheduling."""
-        attempt_id = self._start_attempt()
-        answers = [
+        """Three separate passing attempts in a row (the MASTERY_STREAK_THRESHOLD) should
+        flip the topic to mastered and push the next-eligible date out via Leitner box
+        scheduling. Mastery is scored per whole attempt (>= PASS_THRESHOLD), not per
+        individual answer, so this takes three submissions, not three questions in one."""
+        all_correct = [
             {"question": q.id, "selected_option": self.correct_options[i].id}
             for i, q in enumerate(self.questions)
         ]
-        self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
+        for _ in range(3):
+            attempt_id = self._start_attempt()
+            self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": all_correct}, format="json")
 
         mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
         self.assertEqual(mastery.streak_correct, 3)
         self.assertEqual(mastery.mastery_status, "mastered")
         self.assertGreater(mastery.next_eligible_at, timezone.now())
+
+    def test_topic_mastery_scores_whole_attempt_not_last_answer(self):
+        """A strong attempt (2 of 3 correct, 67% -- below PASS_THRESHOLD) must not be
+        overwritten by whichever answer happens to be graded last; regression test for the
+        bug where TopicMastery updated once per AttemptAnswer instead of once per attempt."""
+        attempt_id = self._start_attempt()
+        answers = [
+            {"question": self.questions[0].id, "selected_option": self.correct_options[0].id},
+            {"question": self.questions[1].id, "selected_option": self.correct_options[1].id},
+            {"question": self.questions[2].id, "selected_option": self.wrong_options[2].id},
+        ]
+        self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
+
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        # 2/3 = 66.67%, below the 80% pass mark, regardless of the last answer being wrong.
+        self.assertEqual(mastery.streak_correct, 0)
+        self.assertEqual(mastery.box_index, 0)
 
     def test_topic_mastery_resets_on_a_wrong_answer(self):
         attempt_id = self._start_attempt()
@@ -154,6 +177,73 @@ class AdaptiveRetrainingTests(APITestCase):
         self.assertEqual(mastery.streak_correct, 0)
         self.assertEqual(mastery.box_index, 0)
         self.assertEqual(mastery.mastery_status, "in_progress")
+
+    def test_hard_question_weighted_more_than_easy_for_mastery(self):
+        """Difficulty-weighted scoring: 3/4 correct (75%) fails the plain pass mark, but
+        weighting a hard question higher than easy ones (Ye, Su & Cao, KDD 2022) pushes
+        the same attempt to exactly 80% because the one correct answer was the hard one."""
+        hard_q = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Hard?", explanation="Because.",
+            status="approved", difficulty="hard",
+        )
+        hard_correct = Option.objects.create(question=hard_q, option_text="Right", is_correct=True)
+        easy_qs, easy_correct, easy_wrong = [], [], []
+        for i in range(3):
+            q = Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"Easy {i}?", explanation="Because.",
+                status="approved", difficulty="easy",
+            )
+            easy_qs.append(q)
+            easy_correct.append(Option.objects.create(question=q, option_text="Right", is_correct=True))
+            easy_wrong.append(Option.objects.create(question=q, option_text="Wrong", is_correct=False))
+
+        attempt_id = self._start_attempt()
+        answers = [
+            {"question": hard_q.id, "selected_option": hard_correct.id},
+            {"question": easy_qs[0].id, "selected_option": easy_correct[0].id},
+            {"question": easy_qs[1].id, "selected_option": easy_correct[1].id},
+            {"question": easy_qs[2].id, "selected_option": easy_wrong[2].id},
+        ]
+        response = self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
+        self.assertEqual(float(response.data["score"]), 75.0)  # plain score: 3/4 correct
+
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        # Weighted: (2.0 hard + 1.0 + 1.0) / (2.0 + 1.0 + 1.0 + 1.0) = 4.0/5.0 = 80% -> pass.
+        self.assertEqual(mastery.streak_correct, 1)
+        self.assertEqual(mastery.box_index, 1)
+
+    def test_low_confidence_question_excluded_from_mastery_scoring(self):
+        """Confidence-aware scoring: a wrong answer on a low-confidence AI-drafted
+        question (Geng et al., NAACL 2024, on LLM confidence miscalibration) shouldn't
+        unfairly reset an otherwise-strong attempt's schedule."""
+        trusted_qs, trusted_correct = [], []
+        for i in range(3):
+            q = Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"Trusted {i}?", explanation="Because.",
+                status="approved", confidence_score=0.9,
+            )
+            trusted_qs.append(q)
+            trusted_correct.append(Option.objects.create(question=q, option_text="Right", is_correct=True))
+        ambiguous_q = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Ambiguous?", explanation="Because.",
+            status="approved", confidence_score=0.2,
+        )
+        ambiguous_wrong = Option.objects.create(question=ambiguous_q, option_text="Wrong", is_correct=False)
+
+        attempt_id = self._start_attempt()
+        answers = [
+            {"question": trusted_qs[0].id, "selected_option": trusted_correct[0].id},
+            {"question": trusted_qs[1].id, "selected_option": trusted_correct[1].id},
+            {"question": trusted_qs[2].id, "selected_option": trusted_correct[2].id},
+            {"question": ambiguous_q.id, "selected_option": ambiguous_wrong.id},
+        ]
+        response = self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
+        self.assertEqual(float(response.data["score"]), 75.0)  # plain score: 3/4 correct
+
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        # Excluding the low-confidence miss: 3/3 trusted answers correct -> 100% -> pass.
+        self.assertEqual(mastery.streak_correct, 1)
+        self.assertEqual(mastery.box_index, 1)
 
     def test_auto_assigned_excludes_mastered_topics_even_if_due(self):
         other_sop = SOPDocument.objects.create(
@@ -203,3 +293,204 @@ class AdaptiveRetrainingTests(APITestCase):
         )
         response = self.client.get("/api/attempts/auto-assigned/")
         self.assertEqual(response.data["assignments"], [])
+
+    def test_retraining_status_requires_reviewer_or_admin(self):
+        response = self.client.get("/api/attempts/retraining-status/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_retraining_status_lists_unmastered_learners_and_flags_escalation(self):
+        TopicMastery.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+            box_index=0, streak_correct=0, mastery_status="in_progress",
+            next_eligible_at=timezone.now() - datetime.timedelta(days=1),
+        )
+        TopicMastery.objects.create(
+            learner=self.other_learner, sop=self.sop, job_role=self.role,
+            box_index=5, streak_correct=3, mastery_status="mastered",
+            next_eligible_at=timezone.now() + datetime.timedelta(days=30),
+        )
+        for score in [10, 20, 30]:
+            attempt = self.client.post(
+                "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
+            ).data["id"]
+            self.client.post(
+                f"/api/attempts/quiz-attempts/{attempt}/submit/",
+                {"answers": [{"question": self.questions[0].id, "selected_option": self.wrong_options[0].id}]},
+                format="json",
+            )
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/attempts/retraining-status/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        learners = {row["learner"]: row for row in response.data["learners"]}
+        self.assertIn("rohit", learners)
+        self.assertNotIn("priya", learners)  # mastered, excluded
+        self.assertGreaterEqual(learners["rohit"]["failed_attempts"], 3)
+        self.assertTrue(learners["rohit"]["escalated"])
+
+
+class AdaptiveEloRatingTests(APITestCase):
+    """Elo rating (Pelánek, Computers & Education 98, 2016): every answered question
+    nudges the learner's per-SOP ability (TopicMastery.elo_rating) and the question's
+    own live difficulty (Question.elo_rating) in opposite directions."""
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-905", version="v1.0", department="Production",
+            file="sops/sop-905.txt", status="processed",
+        )
+        self.question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q?", explanation="Because.", status="approved",
+        )
+        self.correct_option = Option.objects.create(question=self.question, option_text="Right", is_correct=True)
+        self.wrong_option = Option.objects.create(question=self.question, option_text="Wrong", is_correct=False)
+        self.client.force_authenticate(user=self.learner)
+
+    def test_apply_elo_update_raises_learner_and_lowers_question_on_a_correct_answer(self):
+        mastery = TopicMastery(elo_rating=1500)
+        question = Question(elo_rating=1500)
+        apply_elo_update(mastery, question, is_correct=True)
+        self.assertGreater(mastery.elo_rating, 1500)
+        self.assertLess(question.elo_rating, 1500)
+
+    def test_apply_elo_update_lowers_learner_and_raises_question_on_a_wrong_answer(self):
+        mastery = TopicMastery(elo_rating=1500)
+        question = Question(elo_rating=1500)
+        apply_elo_update(mastery, question, is_correct=False)
+        self.assertLess(mastery.elo_rating, 1500)
+        self.assertGreater(question.elo_rating, 1500)
+
+    def test_beating_a_harder_question_moves_rating_more_than_beating_an_easy_one(self):
+        favoured_mastery = TopicMastery(elo_rating=1500)
+        easy_question = Question(elo_rating=1300)  # learner already expected to win
+        apply_elo_update(favoured_mastery, easy_question, is_correct=True)
+
+        underdog_mastery = TopicMastery(elo_rating=1500)
+        hard_question = Question(elo_rating=1700)  # question already expected to win
+        apply_elo_update(underdog_mastery, hard_question, is_correct=True)
+
+        self.assertGreater(underdog_mastery.elo_rating - 1500, favoured_mastery.elo_rating - 1500)
+
+    def test_submitting_a_quiz_updates_both_learner_and_question_elo_ratings(self):
+        attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
+        ).data["id"]
+        self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id}/submit/",
+            {"answers": [{"question": self.question.id, "selected_option": self.correct_option.id}]},
+            format="json",
+        )
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        self.question.refresh_from_db()
+        self.assertGreater(mastery.elo_rating, 1500)
+        self.assertLess(self.question.elo_rating, 1500)
+
+    def test_suggested_difficulty_tracks_elo_rating_not_streak(self):
+        """A learner with a high ability rating but zero streak (e.g. just transferred in
+        and hasn't yet strung together a mastery streak) should still be offered harder
+        material -- the fix for the cold-start fairness gap the streak-only heuristic had."""
+        TopicMastery.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+            box_index=0, streak_correct=0, elo_rating=1750,
+            next_eligible_at=timezone.now() - datetime.timedelta(days=1),
+        )
+        response = self.client.get("/api/attempts/auto-assigned/")
+        assignment = response.data["assignments"][0]
+        self.assertEqual(assignment["suggested_difficulty"], "hard")
+        self.assertEqual(assignment["elo_rating"], 1750)
+
+
+class FSRSAlgorithmTests(APITestCase):
+    """Pure-function tests for the FSRS memory model (see fsrs.py) -- no DB needed."""
+
+    def test_first_review_uses_initial_stability_and_difficulty(self):
+        stability, difficulty = fsrs.review(None, None, elapsed_days=0, is_correct=True)
+        self.assertEqual(stability, fsrs.initial_stability(fsrs.GOOD))
+        self.assertEqual(difficulty, fsrs.initial_difficulty(fsrs.GOOD))
+
+    def test_retrievability_decays_as_elapsed_time_grows(self):
+        r_soon = fsrs.retrievability(elapsed_days=1, stability=10)
+        r_later = fsrs.retrievability(elapsed_days=30, stability=10)
+        self.assertGreater(r_soon, r_later)
+        self.assertGreaterEqual(r_later, 0.0)
+
+    def test_retrievability_is_ninety_percent_when_elapsed_equals_stability(self):
+        self.assertAlmostEqual(fsrs.retrievability(elapsed_days=10, stability=10), 0.9, places=6)
+
+    def test_stability_grows_after_a_correct_answer(self):
+        stability, difficulty = fsrs.review(None, None, elapsed_days=0, is_correct=True)
+        new_stability, _ = fsrs.review(stability, difficulty, elapsed_days=5, is_correct=True)
+        self.assertGreater(new_stability, stability)
+
+    def test_stability_drops_sharply_after_a_wrong_answer(self):
+        stability, difficulty = fsrs.review(None, None, elapsed_days=0, is_correct=True)
+        grown_stability, grown_difficulty = fsrs.review(stability, difficulty, elapsed_days=5, is_correct=True)
+        after_failure, _ = fsrs.review(grown_stability, grown_difficulty, elapsed_days=5, is_correct=False)
+        self.assertLess(after_failure, grown_stability)
+
+    def test_difficulty_increases_after_a_wrong_answer(self):
+        stability, difficulty = fsrs.review(None, None, elapsed_days=0, is_correct=True)
+        _, new_difficulty = fsrs.review(stability, difficulty, elapsed_days=5, is_correct=False)
+        self.assertGreater(new_difficulty, difficulty)
+
+    def test_next_review_interval_grows_as_stability_grows(self):
+        short = fsrs.next_review_interval_days(stability=2)
+        long = fsrs.next_review_interval_days(stability=20)
+        self.assertGreater(long, short)
+        self.assertGreaterEqual(short, fsrs.MIN_INTERVAL_DAYS)
+
+
+class AdaptiveFSRSSchedulingTests(APITestCase):
+    """Integration tests: TopicMastery.apply_answer() driving next_eligible_at via FSRS
+    instead of the old fixed BOX_INTERVAL_DAYS lookup."""
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-906", version="v1.0", department="Production",
+            file="sops/sop-906.txt", status="processed",
+        )
+        self.question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q?", explanation="Because.", status="approved",
+        )
+        self.correct_option = Option.objects.create(question=self.question, option_text="Right", is_correct=True)
+        self.client.force_authenticate(user=self.learner)
+
+    def _submit(self, selected_option_id):
+        attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
+        ).data["id"]
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id}/submit/",
+            {"answers": [{"question": self.question.id, "selected_option": selected_option_id}]},
+            format="json",
+        )
+
+    def test_first_submission_populates_fsrs_state(self):
+        self._submit(self.correct_option.id)
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        self.assertIsNotNone(mastery.fsrs_stability)
+        self.assertIsNotNone(mastery.fsrs_difficulty)
+        self.assertGreater(mastery.next_eligible_at, timezone.now())
+
+    def test_scheduled_interval_is_fsrs_derived_not_a_fixed_leitner_day_count(self):
+        self._submit(self.correct_option.id)
+        mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
+        expected_interval = fsrs.next_review_interval_days(mastery.fsrs_stability)
+        actual_interval = (mastery.next_eligible_at - mastery.updated_at).total_seconds() / 86400.0
+        self.assertAlmostEqual(actual_interval, expected_interval, delta=0.01)
+        # The old scheme would have scheduled exactly 1 day (box_index 0); FSRS's
+        # initial-stability-derived interval for a first correct answer is not 1.0.
+        self.assertNotAlmostEqual(expected_interval, 1.0, places=3)
+
+    def test_memory_stability_surfaced_in_retraining_status(self):
+        self._submit(self.correct_option.id)  # streak_correct=1 < MASTERY_STREAK_THRESHOLD, so still "in_progress"
+        admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
+        self.client.force_authenticate(user=admin)
+        response = self.client.get("/api/attempts/retraining-status/")
+        rows = [r for r in response.data["learners"] if r["learner"] == "rohit"]
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["memory_stability_days"])

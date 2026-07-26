@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Activity,
@@ -37,6 +37,7 @@ import {
   askSopQuestion,
   createQuizAttempt,
   createSopDocument,
+  deleteSopDocument,
   downloadAuditLogCsv,
   generateQuiz,
   getApprovedQuestionsForRole,
@@ -47,6 +48,7 @@ import {
   getMe,
   getQuestions,
   getRecommendedRefresher,
+  getRetrainingStatus,
   getSopDocuments,
   getStoredToken,
   login,
@@ -55,6 +57,7 @@ import {
   rejectQuestion,
   setAuthToken,
   submitQuizAttempt,
+  updateQuestion,
 } from "./services/api";
 
 const navigation = [
@@ -115,34 +118,146 @@ function initialsFor(user) {
   return `${first}${last}`.toUpperCase();
 }
 
-function Topbar({ title, currentUser, onLogout }) {
+function Topbar({ title, currentUser, onLogout, documents, questions, learnerProfiles, summary, onNavigate }) {
   const displayName = currentUser
     ? [currentUser.first_name, currentUser.last_name].filter(Boolean).join(" ") || currentUser.username
     : "Guest";
   const displayRole = currentUser?.is_staff
     ? "Admin / QA"
-    : currentUser?.learner_profile?.job_role?.name || "No role assigned";
+    : currentUser?.learner_profile?.job_role?.name
+      || (currentUser?.roles?.is_reviewer ? "SME Reviewer" : "No role assigned");
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
+  const searchBoxRef = useRef(null);
+  const notifRef = useRef(null);
+  const profileRef = useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(event.target)) setSearchTerm("");
+      if (notifRef.current && !notifRef.current.contains(event.target)) setShowNotifications(false);
+      if (profileRef.current && !profileRef.current.contains(event.target)) setShowProfile(false);
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const term = searchTerm.trim().toLowerCase();
+  const sopMatches = term
+    ? (documents || []).filter((d) => d.sop_code?.toLowerCase().includes(term) || d.title?.toLowerCase().includes(term)).slice(0, 4)
+    : [];
+  const questionMatches = term
+    ? (questions || []).filter((q) => q.question_text?.toLowerCase().includes(term)).slice(0, 4)
+    : [];
+  const learnerMatches = term
+    ? (learnerProfiles || [])
+        .filter((l) => `${l.username || ""} ${l.first_name || ""} ${l.last_name || ""}`.toLowerCase().includes(term))
+        .slice(0, 4)
+    : [];
+  const hasResults = sopMatches.length > 0 || questionMatches.length > 0 || learnerMatches.length > 0;
+
+  function goTo(page) {
+    onNavigate?.(page);
+    setSearchTerm("");
+  }
+
+  const recentActivity = summary?.recent_activity || [];
 
   return (
     <header className="topbar">
       <div className="topbar__title">{title}</div>
-      <label className="topbar__search">
+      <label className="topbar__search" ref={searchBoxRef} style={{ position: "relative" }}>
         <Search size={15} className="icon" />
-        <input placeholder="Search SOPs, questions, learners..." />
+        <input
+          onChange={(event) => setSearchTerm(event.target.value)}
+          placeholder="Search SOPs, questions, learners..."
+          value={searchTerm}
+        />
+        {term && (
+          <div className="search-results">
+            {!hasResults && <div className="search-results__empty">No matches for “{searchTerm}”.</div>}
+            {sopMatches.length > 0 && (
+              <div className="search-results__group">
+                <div className="search-results__label">SOPs</div>
+                {sopMatches.map((d) => (
+                  <button key={d.id} onClick={() => goTo("sop-library")} type="button">
+                    {d.sop_code} — {d.title}
+                  </button>
+                ))}
+              </div>
+            )}
+            {questionMatches.length > 0 && (
+              <div className="search-results__group">
+                <div className="search-results__label">Questions</div>
+                {questionMatches.map((q) => (
+                  <button key={q.id} onClick={() => goTo("question-review")} type="button">
+                    {q.question_text.slice(0, 70)}
+                  </button>
+                ))}
+              </div>
+            )}
+            {learnerMatches.length > 0 && (
+              <div className="search-results__group">
+                <div className="search-results__label">Learners</div>
+                {learnerMatches.map((l) => (
+                  <button key={l.id} onClick={() => goTo("users")} type="button">
+                    {[l.first_name, l.last_name].filter(Boolean).join(" ") || l.username}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </label>
       <div className="topbar__actions">
-        <button className="icon-btn" aria-label="Notifications" type="button">
-          <Bell size={16} />
-          <span className="dot" />
-        </button>
-        <button className="avatar" type="button">
-          <span className="avatar__img">{initialsFor(currentUser)}</span>
-          <span>
-            <span className="avatar__name">{displayName}</span>
-            <span className="avatar__role">{displayRole}</span>
-          </span>
-          <ChevronDown size={14} color="#64748B" />
-        </button>
+        <div className="dropdown-anchor" ref={notifRef}>
+          <button
+            className="icon-btn"
+            aria-label="Notifications"
+            onClick={() => setShowNotifications((v) => !v)}
+            type="button"
+          >
+            <Bell size={16} />
+            {recentActivity.length > 0 && <span className="dot" />}
+          </button>
+          {showNotifications && (
+            <div className="dropdown-panel">
+              <div className="dropdown-panel__title">Recent Activity</div>
+              {recentActivity.length === 0 && <div className="dropdown-panel__empty">Nothing yet.</div>}
+              {recentActivity.slice(0, 5).map((item, i) => (
+                <div className="dropdown-panel__item" key={i}>
+                  <div>{item.text}</div>
+                  <div className="muted-small">{item.meta}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="dropdown-anchor" ref={profileRef}>
+          <button className="avatar" onClick={() => setShowProfile((v) => !v)} type="button">
+            <span className="avatar__img">{initialsFor(currentUser)}</span>
+            <span>
+              <span className="avatar__name">{displayName}</span>
+              <span className="avatar__role">{displayRole}</span>
+            </span>
+            <ChevronDown size={14} color="#64748B" />
+          </button>
+          {showProfile && (
+            <div className="dropdown-panel dropdown-panel--right">
+              <div className="dropdown-panel__title">{displayName}</div>
+              <div className="dropdown-panel__item">
+                <div className="muted-small">Username</div>
+                <div>{currentUser?.username || "-"}</div>
+              </div>
+              <div className="dropdown-panel__item">
+                <div className="muted-small">Role</div>
+                <div>{displayRole}</div>
+              </div>
+            </div>
+          )}
+        </div>
         <button className="icon-btn" aria-label="Log out" onClick={onLogout} type="button">
           <LogOut size={16} />
         </button>
@@ -192,9 +307,6 @@ function LoginScreen({ onLogin }) {
             {isSubmitting ? "Signing in..." : "Sign In"}
           </button>
         </form>
-        <p className="muted-small">
-          Demo accounts (seed data): rohit / priya / arun / sneha / karan / anjali — password demo12345
-        </p>
       </div>
     </div>
   );
@@ -207,7 +319,7 @@ const fallbackStats = [
   { label: "Average Score", value: "82.4%", delta: "+1.6%", icon: BarChart3 },
 ];
 
-const workflow = [
+const workflowFallback = [
   { n: 1, label: "SOP Upload", meta: "PDF / DOCX", icon: Upload },
   { n: 2, label: "Text Extraction", meta: "OCR + parsing", icon: FileSearch },
   { n: 3, label: "AI Quiz Draft", meta: "Role-specific", icon: Sparkles },
@@ -216,6 +328,28 @@ const workflow = [
   { n: 6, label: "Learner Attempt", meta: "Scored attempts", icon: CheckSquare },
   { n: 7, label: "Feedback", meta: "Gaps and retraining", icon: Activity },
 ];
+
+function buildWorkflow(summary) {
+  if (!summary) {
+    return workflowFallback;
+  }
+  return [
+    { n: 1, label: "SOP Upload", meta: `${summary.sops} uploaded`, icon: Upload },
+    { n: 2, label: "Text Extraction", meta: `${summary.processed_sops} processed`, icon: FileSearch },
+    { n: 3, label: "AI Quiz Draft", meta: `${summary.questions} drafted`, icon: Sparkles },
+    { n: 4, label: "QA Review", meta: `${summary.approved_questions} approved`, icon: ShieldCheck },
+    { n: 5, label: "Published Quiz", meta: `${summary.published_quiz_count ?? 0} live quizzes`, icon: Send },
+    { n: 6, label: "Learner Attempt", meta: `${summary.attempts} scored attempts`, icon: CheckSquare },
+    {
+      n: 7,
+      label: "Feedback",
+      meta: summary.retraining_due_count
+        ? `${summary.retraining_due_count} due for retraining`
+        : "None due right now",
+      icon: Activity,
+    },
+  ];
+}
 
 const activity = [
   { text: "SOP-217 Aseptic Gowning Procedure was processed", meta: "2 minutes ago · System" },
@@ -255,6 +389,7 @@ function Dashboard({ summary, apiStatus, isAdmin }) {
         { label: "Average Score", value: `${summary.average_score}%`, delta: "Live backend data", icon: BarChart3 },
       ]
     : fallbackStats;
+  const workflow = buildWorkflow(summary);
   const dashboardActivity = summary?.recent_activity?.length ? summary.recent_activity : activity;
   const dashboardCompliance = summary?.attempts_by_role?.length
     ? summary.attempts_by_role.map((item) => ({ label: item.role, value: Math.round(item.average_score) }))
@@ -375,6 +510,40 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState(null);
   const [message, setMessage] = useState(null);
+  const [rowError, setRowError] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+
+  function handleView(item) {
+    if (!item.file) return;
+    window.open(item.file, "_blank", "noopener,noreferrer");
+  }
+
+  function handleDownload(item) {
+    if (!item.file) return;
+    const link = document.createElement("a");
+    link.href = item.file;
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  async function handleDelete(item) {
+    const confirmed = window.confirm(
+      `Delete ${item.code} — ${item.title}? This permanently removes it and every question, quiz attempt, and answer generated from it. This cannot be undone.`
+    );
+    if (!confirmed) return;
+    setRowError(null);
+    setDeletingId(item.id);
+    try {
+      await deleteSopDocument(item.id);
+      await onUploaded?.();
+    } catch (err) {
+      setRowError(err.message || "Could not delete this SOP.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
 
   const askableSops = documents?.filter((doc) => doc.status === "processed") ?? [];
   const [chatSopId, setChatSopId] = useState("");
@@ -403,12 +572,15 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
 
   const documentsToShow = documents?.length
     ? documents.map((item) => ({
+        id: item.id,
         code: item.sop_code,
         title: item.title,
         department: item.department,
         version: item.version,
         status: item.status_label,
         date: new Date(item.created_at).toISOString().slice(0, 10),
+        file: item.file,
+        isLive: true,
       }))
     : fallbackSops;
 
@@ -550,15 +722,40 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
                   <td>{item.date}</td>
                   <td>
                     <div className="actions">
-                      <button className="link-btn" aria-label="View SOP" type="button"><Eye size={14} /></button>
-                      <button className="link-btn" aria-label="Download SOP" type="button"><Download size={14} /></button>
-                      <button className="link-btn danger" aria-label="Delete SOP" type="button"><Trash2 size={14} /></button>
+                      <button
+                        className="link-btn"
+                        aria-label="View SOP"
+                        disabled={!item.isLive}
+                        onClick={() => handleView(item)}
+                        type="button"
+                      >
+                        <Eye size={14} />
+                      </button>
+                      <button
+                        className="link-btn"
+                        aria-label="Download SOP"
+                        disabled={!item.isLive}
+                        onClick={() => handleDownload(item)}
+                        type="button"
+                      >
+                        <Download size={14} />
+                      </button>
+                      <button
+                        className="link-btn danger"
+                        aria-label="Delete SOP"
+                        disabled={!item.isLive || !canUpload || deletingId === item.id}
+                        onClick={() => handleDelete(item)}
+                        type="button"
+                      >
+                        <Trash2 size={14} />
+                      </button>
                     </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {rowError && <p className="text-error" style={{ marginTop: "10px" }}>{rowError}</p>}
         </div>
       </section>
 
@@ -807,11 +1004,14 @@ const reviewQuestions = [
   },
 ];
 
-function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, onRejectQuestion }) {
+function QuestionReview({ questions, apiStatus, canReview, canEdit, onApproveQuestion, onRejectQuestion, onUpdateQuestion }) {
   const [pending, setPending] = useState(null); // { id, action, label }
   const [password, setPassword] = useState("");
   const [signatureError, setSignatureError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [editing, setEditing] = useState(null); // { id, questionText, explanation, difficulty }
+  const [editError, setEditError] = useState("");
+  const [editSubmitting, setEditSubmitting] = useState(false);
 
   const questionsToShow = questions?.length
     ? questions.map((item) => ({
@@ -825,6 +1025,8 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
         explanation: item.explanation,
         status: titleCase(item.status),
         confidence: item.confidence_score,
+        generationSource: item.generation_source,
+        eloRating: item.elo_rating,
         isLive: true,
       }))
     : reviewQuestions.map((item, index) => ({ ...item, id: `fallback-${index}`, status: "Pending Review", isLive: false }));
@@ -857,6 +1059,34 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
     }
   }
 
+  function openEdit(item) {
+    setEditing({
+      id: item.id,
+      questionText: item.question,
+      explanation: item.explanation,
+      difficulty: item.difficulty.toLowerCase(),
+    });
+    setEditError("");
+  }
+
+  async function saveEdit() {
+    if (!editing) return;
+    setEditSubmitting(true);
+    setEditError("");
+    try {
+      await onUpdateQuestion(editing.id, {
+        question_text: editing.questionText,
+        explanation: editing.explanation,
+        difficulty: editing.difficulty,
+      });
+      setEditing(null);
+    } catch (err) {
+      setEditError(err.message || "Could not save changes.");
+    } finally {
+      setEditSubmitting(false);
+    }
+  }
+
   return (
     <div className="page">
       <PageHeader
@@ -879,6 +1109,8 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
               <span className={difficultyBadge[item.difficulty]}>{item.difficulty}</span>
               <span className={questionStatusBadge(item.status)}>{item.status}</span>
               <ConfidenceBadge value={item.confidence} />
+              <SourceBadge value={item.generationSource} />
+              <EloBadge value={item.eloRating} />
             </div>
             <div className="muted-small">Question #{index + 1}</div>
           </div>
@@ -897,7 +1129,14 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
             >
               <Check size={14} /> Approve
             </button>
-            <button className="btn" type="button"><Edit3 size={14} /> Edit</button>
+            <button
+              className="btn"
+              disabled={!canEdit || !item.isLive || item.status === "Approved"}
+              onClick={() => openEdit(item)}
+              type="button"
+            >
+              <Edit3 size={14} /> Edit
+            </button>
             <button
               className="btn btn--danger"
               disabled={!canReview || !item.isLive || item.status === "Rejected"}
@@ -909,6 +1148,9 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
           </div>
           {!canReview && (
             <p className="muted-small">Only Admin or SME Reviewer accounts can approve or reject questions.</p>
+          )}
+          {canReview && !canEdit && (
+            <p className="muted-small">Only Admin accounts can edit question content.</p>
           )}
         </article>
       ))}
@@ -943,6 +1185,57 @@ function QuestionReview({ questions, apiStatus, canReview, onApproveQuestion, on
                 type="button"
               >
                 {submitting ? "Confirming…" : `Confirm & ${pending.action === "approve" ? "Approve" : "Reject"}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editing && (
+        <div className="esign-overlay">
+          <div className="esign-modal">
+            <h3>Edit Question</h3>
+            <p className="muted-small">
+              Editing is only available before a question is approved — an approved question's content is locked in
+              by its electronic signature.
+            </p>
+            <label className="field">
+              <span>Question text</span>
+              <textarea
+                onChange={(event) => setEditing((current) => ({ ...current, questionText: event.target.value }))}
+                value={editing.questionText}
+              />
+            </label>
+            <label className="field">
+              <span>Explanation</span>
+              <textarea
+                onChange={(event) => setEditing((current) => ({ ...current, explanation: event.target.value }))}
+                value={editing.explanation}
+              />
+            </label>
+            <label className="field">
+              <span>Difficulty</span>
+              <select
+                onChange={(event) => setEditing((current) => ({ ...current, difficulty: event.target.value }))}
+                value={editing.difficulty}
+              >
+                <option value="easy">Easy</option>
+                <option value="medium">Medium</option>
+                <option value="hard">Hard</option>
+              </select>
+            </label>
+            {editError && <p className="text-error">{editError}</p>}
+            <div className="esign-actions">
+              <button className="btn" disabled={editSubmitting} onClick={() => setEditing(null)} type="button">
+                Cancel
+              </button>
+              <button
+                className="btn btn--primary"
+                disabled={editSubmitting || !editing.questionText.trim() || !editing.explanation.trim()}
+                onClick={saveEdit}
+                type="button"
+              >
+                {editSubmitting ? "Saving…" : "Save Changes"}
               </button>
             </div>
           </div>
@@ -1085,6 +1378,23 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
     setActionError(null);
   }
 
+  function handleContinueAssigned(item) {
+    // Hard auto-assignment: the backend already created this QuizAttempt (see
+    // GET /api/attempts/auto-assigned/) -- jump straight into it instead of
+    // requiring a separate Start Quiz click. When the backend found specific
+    // previously-missed questions (item.targeted), retest only those instead of the
+    // whole SOP quiz.
+    const bySop = approvedQuestions.filter((question) => String(question.sop) === String(item.sop_id));
+    const snapshot = item.targeted && item.question_ids?.length
+      ? bySop.filter((question) => item.question_ids.includes(question.id))
+      : bySop;
+    setActionError(null);
+    setAttempt({ id: item.attempt_id, questions: snapshot.length ? snapshot : bySop });
+    setIndex(0);
+    setAnswers({});
+    setResult(null);
+  }
+
   if (!currentUser) {
     return (
       <div className="page">
@@ -1184,10 +1494,22 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
             </div>
             {dueAssignments.map((item) => (
               <div className="q-card__source" key={item.sop_id} style={{ marginBottom: "10px" }}>
+                <div className="badge-row" style={{ marginBottom: "6px" }}>
+                  {item.suggested_difficulty && (
+                    <span className={difficultyBadge[titleCase(item.suggested_difficulty)]}>
+                      {titleCase(item.suggested_difficulty)}
+                    </span>
+                  )}
+                  {typeof item.elo_rating === "number" && (
+                    <span className="badge--elo" title="Your live ability rating on this SOP, based on real answers">
+                      Your rating: {item.elo_rating}
+                    </span>
+                  )}
+                </div>
                 <strong>{item.sop_code}</strong> ({item.sop_title}) — {item.reason}
                 <div className="button-row">
-                  <button className="btn btn--primary" onClick={() => setSopId(String(item.sop_id))} type="button">
-                    <RefreshCw size={14} /> Start {item.sop_code} Retraining
+                  <button className="btn btn--primary" onClick={() => handleContinueAssigned(item)} type="button">
+                    <RefreshCw size={14} /> Continue Assigned Retraining — {item.sop_code}
                   </button>
                 </div>
               </div>
@@ -1301,11 +1623,33 @@ const statusBadge = {
   "In Progress": "badge badge--pending",
 };
 
-function Analytics({ summary, apiStatus }) {
+function Analytics({ summary, apiStatus, canViewRetrainingStatus }) {
   const roleRows = summary?.attempts_by_role ?? [];
   const learnerRows = summary?.learner_progress ?? [];
   const weakTopics = summary?.weak_topics ?? [];
   const atRiskCount = learnerRows.filter((item) => item.status === "Failed").length;
+
+  const [retrainingRows, setRetrainingRows] = useState([]);
+  useEffect(() => {
+    if (!canViewRetrainingStatus) {
+      return;
+    }
+    let cancelled = false;
+    getRetrainingStatus()
+      .then((data) => {
+        if (!cancelled) {
+          setRetrainingRows(data.learners || []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRetrainingRows([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canViewRetrainingStatus]);
 
   return (
     <div className="page">
@@ -1315,7 +1659,7 @@ function Analytics({ summary, apiStatus }) {
         action={<DataStatus status={apiStatus} />}
       />
 
-      <div className="stats stats--three">
+      <div className="stats">
         <StatCard
           delta={summary ? `${summary.attempts} total attempts` : "No data yet"}
           icon={BarChart3}
@@ -1334,6 +1678,20 @@ function Analytics({ summary, apiStatus }) {
           label="At-Risk Learners"
           value={atRiskCount}
           warning={atRiskCount > 0}
+        />
+        <StatCard
+          delta={
+            summary?.retraining_improvement
+              ? `${summary.retraining_improvement.avg_first_score}% -> ${summary.retraining_improvement.avg_latest_score}% across ${summary.retraining_improvement.pairs_with_retraining} learner/SOP pair(s)`
+              : "No repeat attempts yet"
+          }
+          icon={RefreshCw}
+          label="Retraining Improvement"
+          value={
+            summary?.retraining_improvement
+              ? `${summary.retraining_improvement.avg_improvement > 0 ? "+" : ""}${summary.retraining_improvement.avg_improvement}%`
+              : "-"
+          }
         />
       </div>
 
@@ -1402,6 +1760,62 @@ function Analytics({ summary, apiStatus }) {
           </div>
         )}
       </section>
+
+      {canViewRetrainingStatus && (
+        <section className="card">
+          <div className="card__title">
+            Retraining Status <small>Learners not yet mastered, for QA follow-up</small>
+          </div>
+          {retrainingRows.length === 0 ? (
+            <p className="muted-small">No learner is currently in a retraining loop.</p>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Learner</th>
+                    <th>SOP</th>
+                    <th>Box</th>
+                    <th>Streak</th>
+                    <th>Ability (Elo)</th>
+                    <th title="FSRS memory model: projected days until this learner's recall odds on this SOP drop to ~90% without another review">
+                      Memory Stability
+                    </th>
+                    <th>Failed Attempts</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {retrainingRows.map((row, idx) => (
+                    <tr key={`${row.learner}-${row.sop_code}-${idx}`}>
+                      <td className="strong-cell">{row.learner}</td>
+                      <td>{row.sop_code}</td>
+                      <td>{row.box_index}</td>
+                      <td>{row.streak_correct}</td>
+                      <td>{row.elo_rating}</td>
+                      <td>
+                        {row.memory_stability_days === null || row.memory_stability_days === undefined
+                          ? "-"
+                          : `~${row.memory_stability_days}d`}
+                      </td>
+                      <td>{row.failed_attempts}</td>
+                      <td>
+                        {row.escalated ? (
+                          <span className="badge badge--rejected">Escalated</span>
+                        ) : row.is_due ? (
+                          <span className="badge badge--pending">Due Now</span>
+                        ) : (
+                          <span className="badge badge--draft">Scheduled</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -1520,6 +1934,35 @@ function ConfidenceBadge({ value }) {
   const tier = value >= 0.75 ? "high" : value >= 0.5 ? "medium" : "low";
   const label = tier === "low" ? "Low confidence — review closely" : `${percent}% confidence`;
   return <span className={`badge--confidence-${tier}`}>{label}</span>;
+}
+
+function SourceBadge({ value }) {
+  if (!value) {
+    return null;
+  }
+  if (value === "nvidia_nim") {
+    return <span className="badge--source-nim" title="Drafted live by NVIDIA NIM (meta/llama-3.1-8b-instruct)">NVIDIA NIM</span>;
+  }
+  if (value === "mock") {
+    return <span className="badge--source-mock" title="NVIDIA NIM was unreachable; generated by the deterministic offline fallback">Offline fallback</span>;
+  }
+  return <span className="badge--source-manual" title="Hand-authored, not AI-generated">Manually authored</span>;
+}
+
+function EloBadge({ value }) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const rounded = Math.round(value);
+  const isSeeded = [1300, 1500, 1700].includes(rounded);
+  const title = isSeeded
+    ? "Live difficulty rating (Elo) — still at its starting value, no learner answers yet"
+    : "Live difficulty rating (Elo) — drifted from the label above based on real learner answers";
+  return (
+    <span className="badge--elo" title={title}>
+      Elo {rounded}
+    </span>
+  );
 }
 
 function OptionList({ options, correct }) {
@@ -1673,6 +2116,11 @@ function App() {
     }
   }
 
+  async function handleQuestionEdit(id, updates) {
+    const updated = await updateQuestion(id, updates);
+    setQuestions((current) => current.map((item) => (item.id === id ? updated : item)));
+  }
+
   async function refreshAfterSopChange() {
     try {
       const [sopData, summaryData] = await Promise.all([getSopDocuments(), getDashboardSummary()]);
@@ -1743,14 +2191,16 @@ function App() {
     "question-review": (
       <QuestionReview
         canReview={roles.is_reviewer}
+        canEdit={roles.is_admin}
         questions={questions}
         apiStatus={apiStatus}
         onApproveQuestion={(id, password) => handleQuestionStatus(id, "approve", password)}
         onRejectQuestion={(id, password) => handleQuestionStatus(id, "reject", password)}
+        onUpdateQuestion={handleQuestionEdit}
       />
     ),
     "learner-quiz": <LearnerQuiz currentUser={currentUser} onSubmitted={refreshAfterAttempt} />,
-    analytics: <Analytics apiStatus={apiStatus} summary={summary} />,
+    analytics: <Analytics apiStatus={apiStatus} summary={summary} canViewRetrainingStatus={roles.is_admin || roles.is_reviewer} />,
     users: <UsersRoles jobRoles={jobRoles} learnerProfiles={learnerProfiles} />,
   }[effectivePage];
 
@@ -1758,7 +2208,16 @@ function App() {
     <div className="app">
       <Sidebar activePage={effectivePage} currentUser={currentUser} onNavigate={setActivePage} />
       <main className="main">
-        <Topbar currentUser={currentUser} onLogout={handleLogout} title={pageTitles[effectivePage]} />
+        <Topbar
+          currentUser={currentUser}
+          onLogout={handleLogout}
+          title={pageTitles[effectivePage]}
+          documents={documents}
+          questions={questions}
+          learnerProfiles={learnerProfiles}
+          summary={summary}
+          onNavigate={setActivePage}
+        />
         {content}
       </main>
     </div>

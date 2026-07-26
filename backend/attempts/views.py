@@ -3,16 +3,78 @@ from rest_framework import decorators, permissions, response, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from accounts.permissions import ADMIN_GROUP
+from accounts.permissions import ADMIN_GROUP, IsReviewerUser
 from audit.models import log_action
 from quiz.models import Question
 
 from .models import AttemptAnswer, QuizAttempt, TopicMastery
 from .serializers import AttemptAnswerSerializer, QuizAttemptSerializer
+from .services import apply_elo_update
 
 
 def _is_admin(user):
     return bool(user and user.is_authenticated and (user.is_staff or user.groups.filter(name=ADMIN_GROUP).exists()))
+
+
+# A learner failing the same SOP this many times is treated as a compliance signal worth
+# flagging to QA/Admin, not just another automatic retraining cycle.
+RETRAINING_ESCALATION_THRESHOLD = 3
+
+# Difficulty-weighted mastery scoring (see Ye, Su & Cao, "A Stochastic Shortest Path
+# Algorithm for Optimizing Spaced Repetition Scheduling", KDD 2022, and Settles & Meeder,
+# "A Trainable Spaced Repetition Model for Language Learning", ACL 2016, both on why
+# treating every item as equally hard understates what a learner actually knows): a hard
+# question answered correctly counts for more toward the Leitner box advance than an easy
+# one, and vice versa for a miss. The weight now comes from each question's live Elo
+# rating (see services.py) rather than its one-time difficulty label, linearly mapped onto
+# the same 1.0-2.0 range the old easy/medium/hard lookup used, and clamped so a single
+# outlier rating can't dominate the pass/fail signal. ELO_WEIGHT_FLOOR/CEILING reuse
+# Question's own difficulty-seed constants, so a never-yet-answered question reproduces
+# the exact old weight, and only drifts once real answers move its rating.
+ELO_WEIGHT_FLOOR = Question.DIFFICULTY_SEED_ELO["easy"]
+ELO_WEIGHT_CEILING = Question.DIFFICULTY_SEED_ELO["hard"]
+# LLM self-reported confidence is often miscalibrated (Geng et al., "A Survey of
+# Confidence Estimation and Calibration in Large Language Models", NAACL 2024) but it is
+# still the best signal we have that a question might be ambiguous -- a wrong answer on a
+# low-confidence AI-drafted question shouldn't unfairly reset a learner's whole schedule.
+CONFIDENCE_TRUST_THRESHOLD = 0.5
+
+
+def _elo_weight(question):
+    span = ELO_WEIGHT_CEILING - ELO_WEIGHT_FLOOR
+    fraction = (question.elo_rating - ELO_WEIGHT_FLOOR) / span
+    fraction = max(0.0, min(1.0, fraction))
+    return 1.0 + fraction  # 1.0 at/below the easy seed .. 2.0 at/above the hard seed
+
+
+def _retraining_pass_signal(attempt):
+    """Whether this attempt counts as a pass for adaptive-retraining purposes: the plain
+    percentage score used for the learner-facing result screen, but weighted by each
+    question's live Elo difficulty and with low-confidence AI-drafted questions excluded
+    (falling back to all answers if too few trustworthy ones remain to judge fairly).
+
+    Reads elo_rating as it stands *before* this attempt's own answers can move it (Elo
+    updates are applied later in submit(), after this signal is computed) -- otherwise a
+    question's weight would shift mid-calculation depending on iteration order."""
+    answers = list(
+        AttemptAnswer.objects.filter(attempt=attempt).select_related("question")
+    )
+    if not answers:
+        return float(attempt.score) >= TopicMastery.PASS_THRESHOLD
+
+    trustworthy = [
+        a for a in answers
+        if a.question.confidence_score is None or a.question.confidence_score >= CONFIDENCE_TRUST_THRESHOLD
+    ]
+    if len(trustworthy) < max(1, len(answers) // 2):
+        trustworthy = answers
+
+    total_weight = sum(_elo_weight(a.question) for a in trustworthy)
+    if total_weight == 0:
+        return float(attempt.score) >= TopicMastery.PASS_THRESHOLD
+
+    correct_weight = sum(_elo_weight(a.question) for a in trustworthy if a.is_correct)
+    return (correct_weight / total_weight) * 100 >= TopicMastery.PASS_THRESHOLD
 
 
 class QuizAttemptViewSet(viewsets.ModelViewSet):
@@ -41,6 +103,7 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
 
         AttemptAnswer.objects.filter(attempt=attempt).delete()
         correct_count = 0
+        answered_questions = []  # (question, is_correct), for the Elo update below
         for item in submitted_answers:
             question_id = item.get("question")
             selected_option_id = item.get("selected_option")
@@ -56,6 +119,9 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
                 selected_option_id=selected_option_id,
                 is_correct=is_correct,
             )
+            question = Question.objects.filter(id=question_id).first()
+            if question is not None:
+                answered_questions.append((question, is_correct))
 
         total = len(submitted_answers) or 1
         attempt.score = round((correct_count / total) * 100, 2)
@@ -66,6 +132,29 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
             summary=f"{request.user} submitted attempt #{attempt.id} on {attempt.sop.sop_code}, score {attempt.score}%",
             details={"score": float(attempt.score), "answers": len(submitted_answers)},
         )
+
+        # Adaptive-retraining schedule: updated once per completed attempt, from the
+        # attempt's overall score, not once per individual answer (see TopicMastery
+        # docstring in models.py for why that distinction matters).
+        mastery, _ = TopicMastery.objects.get_or_create(
+            learner=attempt.learner, sop=attempt.sop, defaults={"job_role": attempt.job_role}
+        )
+        mastery.job_role = attempt.job_role
+
+        # Compute the pass/fail signal *before* touching any Elo rating, so the weighting
+        # above reads a stable pre-answer snapshot regardless of this loop's order.
+        pass_signal = _retraining_pass_signal(attempt)
+
+        # Elo rating update (see services.py): each answered question nudges both the
+        # learner's per-SOP ability and that question's own live difficulty.
+        touched_questions = [q for q, _is_correct in answered_questions]
+        for question, is_correct in answered_questions:
+            apply_elo_update(mastery, question, is_correct)
+        if touched_questions:
+            Question.objects.bulk_update(touched_questions, ["elo_rating"])
+
+        mastery.apply_answer(pass_signal)
+        mastery.save()
 
         # get_object() prefetched `answers` before the delete/create above, so that cache is
         # stale now. Re-fetch so the serialized response reflects the answers just created.
@@ -88,13 +177,13 @@ class AttemptAnswerViewSet(viewsets.ReadOnlyModelViewSet):
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated])
 def auto_assigned_retraining(request):
-    """Adaptive-retraining auto-assignment (soft): for the requesting learner, find every
+    """Adaptive-retraining auto-assignment (hard): for the requesting learner, find every
     SOP whose TopicMastery schedule (Leitner-style box scheduling, see models.py) says a
-    retest is now due and not yet mastered, and describe it as an assignment with a
-    difficulty-matched suggestion. This only reads state kept up to date by the
-    AttemptAnswer signal (signals.py) — it does not create a QuizAttempt itself; the
-    learner still starts one via the existing POST /api/attempts/quiz-attempts/ endpoint,
-    exactly as they do for any other quiz today."""
+    retest is now due and not yet mastered, and pre-create the QuizAttempt itself instead
+    of only suggesting one -- the learner is taken straight into the quiz, not just handed
+    a pre-filled dropdown. Idempotent: re-checking this endpoint (e.g. on every page load)
+    reuses the same not-yet-completed auto-assigned attempt rather than spawning a new one
+    each time, so retaking the SOP later still goes through the normal Start Quiz flow."""
     due = (
         TopicMastery.objects.filter(learner=request.user, next_eligible_at__lte=timezone.now())
         .exclude(mastery_status="mastered")
@@ -103,9 +192,13 @@ def auto_assigned_retraining(request):
 
     assignments = []
     for mastery in due:
-        if mastery.streak_correct == 0:
+        # Elo-driven, not streak-driven: reflects this learner's actual measured ability
+        # on this SOP (see services.py), so e.g. an experienced transfer who's answered a
+        # few questions correctly gets suggested harder material sooner than a first-day
+        # hire would, even before either has strung together a full mastery streak.
+        if mastery.elo_rating < ELO_WEIGHT_FLOOR:
             suggested_difficulty = "easy"
-        elif mastery.streak_correct < TopicMastery.MASTERY_STREAK_THRESHOLD - 1:
+        elif mastery.elo_rating < ELO_WEIGHT_CEILING:
             suggested_difficulty = "medium"
         else:
             suggested_difficulty = "hard"
@@ -116,6 +209,57 @@ def auto_assigned_retraining(request):
         if available_count == 0:
             continue
 
+        attempt = (
+            QuizAttempt.objects.filter(
+                learner=request.user, sop=mastery.sop, job_role=mastery.job_role, completed_at__isnull=True
+            )
+            .order_by("-started_at")
+            .first()
+        )
+        if attempt is None:
+            attempt = QuizAttempt.objects.create(learner=request.user, sop=mastery.sop, job_role=mastery.job_role)
+            log_action(
+                request.user, "quiz_attempt_auto_assigned", attempt,
+                summary=(
+                    f"Auto-assigned retraining attempt #{attempt.id} for {request.user} on "
+                    f"{mastery.sop.sop_code} (box {mastery.box_index})"
+                ),
+                details={"box_index": mastery.box_index, "streak_correct": mastery.streak_correct},
+            )
+
+            # Compliance escalation: a learner stuck failing the same SOP repeatedly is a
+            # safety/compliance signal, not just a UX detail -- flag it for QA/Admin instead
+            # of letting them cycle through 1-day retests indefinitely with no one noticing.
+            # Fires once per new retraining cycle (not on every page load, since this branch
+            # only runs when a fresh attempt is actually created).
+            failed_attempts = QuizAttempt.objects.filter(
+                learner=request.user, sop=mastery.sop, job_role=mastery.job_role,
+                completed_at__isnull=False, score__lt=TopicMastery.PASS_THRESHOLD,
+            ).count()
+            if failed_attempts >= RETRAINING_ESCALATION_THRESHOLD:
+                log_action(
+                    request.user, "retraining_escalation", attempt,
+                    summary=(
+                        f"{request.user} has failed {mastery.sop.sop_code} {failed_attempts} times -- "
+                        f"flagged for QA/Admin review"
+                    ),
+                    details={"failed_attempts": failed_attempts, "sop_code": mastery.sop.sop_code},
+                )
+
+        # Target the retest at questions this learner has actually gotten wrong before,
+        # instead of re-running the whole quiz including ones they already know cold.
+        # Falls back to the full approved set (question_ids=[]) if there's no wrong-answer
+        # history yet for this SOP (e.g. the very first time it comes due).
+        weak_question_ids = list(
+            AttemptAnswer.objects.filter(
+                attempt__learner=request.user, attempt__sop=mastery.sop, attempt__job_role=mastery.job_role,
+                is_correct=False, question__status="approved",
+            )
+            .values_list("question_id", flat=True)
+            .distinct()
+        )
+        targeted = len(weak_question_ids) > 0
+
         assignments.append(
             {
                 "sop_id": mastery.sop_id,
@@ -124,14 +268,61 @@ def auto_assigned_retraining(request):
                 "job_role_id": mastery.job_role_id,
                 "box_index": mastery.box_index,
                 "streak_correct": mastery.streak_correct,
+                "elo_rating": round(mastery.elo_rating),
+                "memory_stability_days": (
+                    round(mastery.fsrs_stability, 1) if mastery.fsrs_stability is not None else None
+                ),
                 "due_since": mastery.next_eligible_at.isoformat(),
                 "suggested_difficulty": suggested_difficulty,
                 "question_count_available": available_count,
+                "attempt_id": attempt.id,
+                "question_ids": weak_question_ids,
+                "targeted": targeted,
                 "reason": (
                     f"Due for a spaced retest (box {mastery.box_index}) under our adaptive-retraining "
                     f"schedule — {mastery.streak_correct} correct in a row so far on this SOP."
+                    + (
+                        f" Retest focuses on the {len(weak_question_ids)} question(s) you missed before."
+                        if targeted
+                        else ""
+                    )
                 ),
             }
         )
 
     return Response({"assignments": assignments})
+
+
+@api_view(["GET"])
+@permission_classes([IsReviewerUser])
+def retraining_status(request):
+    """Admin/SME-facing visibility into every learner currently stuck in a retraining
+    loop (not yet mastered). Closes a real gap: retraining_escalation events were already
+    being written to the audit trail, but nobody could see them without digging through
+    logs -- this surfaces the same signal as a live, sorted list."""
+    rows = []
+    for mastery in TopicMastery.objects.exclude(mastery_status="mastered").select_related("learner", "sop", "job_role"):
+        failed_attempts = QuizAttempt.objects.filter(
+            learner=mastery.learner, sop=mastery.sop, job_role=mastery.job_role,
+            completed_at__isnull=False, score__lt=TopicMastery.PASS_THRESHOLD,
+        ).count()
+        rows.append(
+            {
+                "learner": mastery.learner.get_full_name() or mastery.learner.username,
+                "sop_code": mastery.sop.sop_code,
+                "sop_title": mastery.sop.title,
+                "job_role": mastery.job_role.name,
+                "box_index": mastery.box_index,
+                "streak_correct": mastery.streak_correct,
+                "elo_rating": round(mastery.elo_rating),
+                "memory_stability_days": (
+                    round(mastery.fsrs_stability, 1) if mastery.fsrs_stability is not None else None
+                ),
+                "next_eligible_at": mastery.next_eligible_at.isoformat(),
+                "is_due": mastery.next_eligible_at <= timezone.now(),
+                "failed_attempts": failed_attempts,
+                "escalated": failed_attempts >= RETRAINING_ESCALATION_THRESHOLD,
+            }
+        )
+    rows.sort(key=lambda r: (-r["failed_attempts"], r["next_eligible_at"]))
+    return Response({"learners": rows})

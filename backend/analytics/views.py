@@ -1,9 +1,12 @@
+from collections import defaultdict
+
 from django.db.models import Avg, Case, Count, FloatField, When
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from attempts.models import AttemptAnswer, QuizAttempt
+from attempts.models import AttemptAnswer, QuizAttempt, TopicMastery
 from quiz.models import Question
 from sops.models import SOPDocument
 
@@ -68,15 +71,49 @@ def dashboard_summary(request):
             }
         )
 
+    # Distinct (SOP, job role) pairs with at least one approved question -- how many
+    # role-specific quizzes are actually live for learners to take, not just drafted.
+    published_quiz_count = (
+        Question.objects.filter(status="approved").values("sop_id", "job_role_id").distinct().count()
+    )
+    # Proves the Leitner adaptive-retraining scheduler (attempts.models.TopicMastery) is
+    # live, not decorative: how many learner/SOP pairs are due for a spaced retest right now.
+    retraining_due_count = TopicMastery.objects.filter(next_eligible_at__lte=timezone.now()).count()
+
+    # Retraining-improvement evidence: for every (learner, SOP) pair with 2+ completed
+    # attempts, compare the score on their first attempt to their most recent one. This is
+    # the one number that shows retraining actually helps, not just that it runs.
+    by_pair = defaultdict(list)
+    for a in QuizAttempt.objects.filter(completed_at__isnull=False).order_by("completed_at"):
+        by_pair[(a.learner_id, a.sop_id)].append(float(a.score))
+    first_scores, latest_scores = [], []
+    for scores in by_pair.values():
+        if len(scores) >= 2:
+            first_scores.append(scores[0])
+            latest_scores.append(scores[-1])
+    retraining_improvement = None
+    if first_scores:
+        avg_first = sum(first_scores) / len(first_scores)
+        avg_latest = sum(latest_scores) / len(latest_scores)
+        retraining_improvement = {
+            "pairs_with_retraining": len(first_scores),
+            "avg_first_score": round(avg_first, 1),
+            "avg_latest_score": round(avg_latest, 1),
+            "avg_improvement": round(avg_latest - avg_first, 1),
+        }
+
     return Response(
         {
             "sops": SOPDocument.objects.count(),
             "processed_sops": SOPDocument.objects.filter(status="processed").count(),
             "questions": Question.objects.count(),
             "approved_questions": Question.objects.filter(status="approved").count(),
+            "published_quiz_count": published_quiz_count,
             "attempts": total_attempts,
             "average_score": round(float(average_score), 1),
             "completion_rate": completion_rate,
+            "retraining_due_count": retraining_due_count,
+            "retraining_improvement": retraining_improvement,
             "attempts_by_role": role_rows,
             "recent_activity": recent_activity,
             "learner_progress": learner_progress,

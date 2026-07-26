@@ -32,7 +32,9 @@ class QuestionSerializer(serializers.ModelSerializer):
             "explanation",
             "status",
             "confidence_score",
+            "elo_rating",
+            "generation_source",
             "created_at",
             "options",
         ]
-        read_only_fields = ["created_at"]
+        read_only_fields = ["created_at", "generation_source", "elo_rating"]

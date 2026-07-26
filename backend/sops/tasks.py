@@ -18,11 +18,12 @@ def process_sop_document_task(sop_id, user_id=None):
     try:
         extracted = extract_text_from_file(sop.file.path)
         SOPChunk.objects.filter(sop=sop).delete()
-        for index, (title, chunk) in enumerate(chunk_text(extracted), start=1):
+        for index, (title, chunk, strategy) in enumerate(chunk_text(extracted), start=1):
             SOPChunk.objects.create(
                 sop=sop,
                 section_title=title or f"Auto chunk {index}",
                 chunk_text=chunk,
+                chunking_strategy=strategy,
             )
         sop.status = "processed"
         sop.save(update_fields=["status"])
