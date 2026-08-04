@@ -7,9 +7,9 @@ from accounts.permissions import ADMIN_GROUP, IsReviewerUser
 from audit.models import log_action
 from quiz.models import Question
 
-from .models import AttemptAnswer, QuizAttempt, TopicMastery
+from .models import AttemptAnswer, ChunkMastery, QuizAttempt, TopicMastery
 from .serializers import AttemptAnswerSerializer, QuizAttemptSerializer
-from .services import apply_elo_update
+from .services import apply_elo_update, apply_elo_update_ability_only
 
 
 def _is_admin(user):
@@ -47,6 +47,27 @@ def _elo_weight(question):
     return 1.0 + fraction  # 1.0 at/below the easy seed .. 2.0 at/above the hard seed
 
 
+def _pass_signal_from_pairs(pairs):
+    """Confidence-aware, Elo-weighted pass/fail signal from a list of (question,
+    is_correct) pairs -- the shared core of both the whole-attempt (TopicMastery) and
+    single-section (ChunkMastery) retraining signals. Caller guarantees pairs is
+    non-empty; the "no answers at all" edge case is handled by callers, not here, since
+    only the whole-attempt case has a plain attempt.score to fall back on."""
+    trustworthy = [
+        (q, correct) for q, correct in pairs
+        if q.confidence_score is None or q.confidence_score >= CONFIDENCE_TRUST_THRESHOLD
+    ]
+    if len(trustworthy) < max(1, len(pairs) // 2):
+        trustworthy = pairs
+
+    total_weight = sum(_elo_weight(q) for q, _correct in trustworthy)
+    if total_weight == 0:
+        return False
+
+    correct_weight = sum(_elo_weight(q) for q, correct in trustworthy if correct)
+    return (correct_weight / total_weight) * 100 >= TopicMastery.PASS_THRESHOLD
+
+
 def _retraining_pass_signal(attempt):
     """Whether this attempt counts as a pass for adaptive-retraining purposes: the plain
     percentage score used for the learner-facing result screen, but weighted by each
@@ -61,20 +82,7 @@ def _retraining_pass_signal(attempt):
     )
     if not answers:
         return float(attempt.score) >= TopicMastery.PASS_THRESHOLD
-
-    trustworthy = [
-        a for a in answers
-        if a.question.confidence_score is None or a.question.confidence_score >= CONFIDENCE_TRUST_THRESHOLD
-    ]
-    if len(trustworthy) < max(1, len(answers) // 2):
-        trustworthy = answers
-
-    total_weight = sum(_elo_weight(a.question) for a in trustworthy)
-    if total_weight == 0:
-        return float(attempt.score) >= TopicMastery.PASS_THRESHOLD
-
-    correct_weight = sum(_elo_weight(a.question) for a in trustworthy if a.is_correct)
-    return (correct_weight / total_weight) * 100 >= TopicMastery.PASS_THRESHOLD
+    return _pass_signal_from_pairs([(a.question, a.is_correct) for a in answers])
 
 
 class QuizAttemptViewSet(viewsets.ModelViewSet):
@@ -141,9 +149,19 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
         )
         mastery.job_role = attempt.job_role
 
-        # Compute the pass/fail signal *before* touching any Elo rating, so the weighting
-        # above reads a stable pre-answer snapshot regardless of this loop's order.
+        # Compute both the whole-SOP and per-section pass/fail signals *before* touching
+        # any Elo rating, so the weighting above reads a stable pre-answer snapshot
+        # regardless of this loop's order (answered_questions holds the same in-memory
+        # Question objects _retraining_pass_signal's DB read will see, still untouched).
         pass_signal = _retraining_pass_signal(attempt)
+        pairs_by_chunk = {}
+        for question, is_correct in answered_questions:
+            if question.source_chunk_id is None:
+                continue  # no section to attribute this answer to (manually-authored question, etc.)
+            pairs_by_chunk.setdefault(question.source_chunk_id, []).append((question, is_correct))
+        chunk_pass_signals = {
+            chunk_id: _pass_signal_from_pairs(pairs) for chunk_id, pairs in pairs_by_chunk.items()
+        }
 
         # Elo rating update (see services.py): each answered question nudges both the
         # learner's per-SOP ability and that question's own live difficulty.
@@ -155,6 +173,21 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
 
         mastery.apply_answer(pass_signal)
         mastery.save()
+
+        # Section-level tracking (ChunkMastery): the finer-grained sibling of the
+        # whole-SOP update above -- a miss in one section only resets that section's
+        # schedule, not every section of the SOP. Ability-only Elo update here (see
+        # services.py) since apply_elo_update() above already moved each question's own
+        # difficulty rating once; doing it again per section would double-count one answer.
+        for chunk_id, pairs in pairs_by_chunk.items():
+            chunk_mastery, _created = ChunkMastery.objects.get_or_create(
+                learner=attempt.learner, sop_chunk_id=chunk_id, defaults={"job_role": attempt.job_role}
+            )
+            chunk_mastery.job_role = attempt.job_role
+            for question, is_correct in pairs:
+                apply_elo_update_ability_only(chunk_mastery, question, is_correct)
+            chunk_mastery.apply_answer(chunk_pass_signals[chunk_id])
+            chunk_mastery.save()
 
         # get_object() prefetched `answers` before the delete/create above, so that cache is
         # stale now. Re-fetch so the serialized response reflects the answers just created.
@@ -246,18 +279,36 @@ def auto_assigned_retraining(request):
                     details={"failed_attempts": failed_attempts, "sop_code": mastery.sop.sop_code},
                 )
 
-        # Target the retest at questions this learner has actually gotten wrong before,
-        # instead of re-running the whole quiz including ones they already know cold.
-        # Falls back to the full approved set (question_ids=[]) if there's no wrong-answer
-        # history yet for this SOP (e.g. the very first time it comes due).
-        weak_question_ids = list(
-            AttemptAnswer.objects.filter(
-                attempt__learner=request.user, attempt__sop=mastery.sop, attempt__job_role=mastery.job_role,
-                is_correct=False, question__status="approved",
-            )
-            .values_list("question_id", flat=True)
-            .distinct()
+        # Target the retest at the specific unmastered section(s) of this SOP first (see
+        # ChunkMastery) -- much more precise than "any question ever missed," since a
+        # one-off fluke on an otherwise-mastered section shouldn't drag the whole SOP's
+        # retest into covering material the learner has since demonstrated they know.
+        unmastered_chunk_ids = list(
+            ChunkMastery.objects.filter(learner=request.user, sop_chunk__sop=mastery.sop, job_role=mastery.job_role)
+            .exclude(mastery_status="mastered")
+            .values_list("sop_chunk_id", flat=True)
         )
+        if unmastered_chunk_ids:
+            weak_question_ids = list(
+                Question.objects.filter(
+                    sop=mastery.sop, job_role=mastery.job_role, status="approved",
+                    source_chunk_id__in=unmastered_chunk_ids,
+                ).values_list("id", flat=True)
+            )
+        else:
+            # No section-level data yet (e.g. these questions predate chunk linkage) --
+            # fall back to the original targeting: questions this learner has actually
+            # gotten wrong before, instead of re-running the whole quiz including ones
+            # they already know cold. Falls back further to the full approved set
+            # (question_ids=[]) if there's no wrong-answer history yet either.
+            weak_question_ids = list(
+                AttemptAnswer.objects.filter(
+                    attempt__learner=request.user, attempt__sop=mastery.sop, attempt__job_role=mastery.job_role,
+                    is_correct=False, question__status="approved",
+                )
+                .values_list("question_id", flat=True)
+                .distinct()
+            )
         targeted = len(weak_question_ids) > 0
 
         assignments.append(
@@ -278,13 +329,18 @@ def auto_assigned_retraining(request):
                 "attempt_id": attempt.id,
                 "question_ids": weak_question_ids,
                 "targeted": targeted,
+                "unmastered_section_count": len(unmastered_chunk_ids),
                 "reason": (
                     f"Due for a spaced retest (box {mastery.box_index}) under our adaptive-retraining "
                     f"schedule — {mastery.streak_correct} correct in a row so far on this SOP."
                     + (
-                        f" Retest focuses on the {len(weak_question_ids)} question(s) you missed before."
-                        if targeted
-                        else ""
+                        f" Retest focuses on {len(unmastered_chunk_ids)} unmastered section(s)."
+                        if unmastered_chunk_ids
+                        else (
+                            f" Retest focuses on the {len(weak_question_ids)} question(s) you missed before."
+                            if targeted
+                            else ""
+                        )
                     )
                 ),
             }
@@ -326,3 +382,36 @@ def retraining_status(request):
         )
     rows.sort(key=lambda r: (-r["failed_attempts"], r["next_eligible_at"]))
     return Response({"learners": rows})
+
+
+@api_view(["GET"])
+@permission_classes([IsReviewerUser])
+def section_mastery_status(request):
+    """Admin/SME-facing visibility at section granularity -- the finer-grained sibling of
+    retraining_status: which specific SOP section a learner is weak in, not just which
+    whole SOP. Closes the "you're solid on 9/10 chapters, weak on 1" visibility gap that
+    whole-SOP TopicMastery alone can't show, since one section's miss no longer looks
+    identical to a SOP-wide struggle."""
+    rows = []
+    for mastery in ChunkMastery.objects.exclude(mastery_status="mastered").select_related(
+        "learner", "sop_chunk", "sop_chunk__sop", "job_role"
+    ):
+        rows.append(
+            {
+                "learner": mastery.learner.get_full_name() or mastery.learner.username,
+                "sop_code": mastery.sop_chunk.sop.sop_code,
+                "sop_title": mastery.sop_chunk.sop.title,
+                "section_title": mastery.sop_chunk.section_title or "Untitled section",
+                "job_role": mastery.job_role.name,
+                "box_index": mastery.box_index,
+                "streak_correct": mastery.streak_correct,
+                "elo_rating": round(mastery.elo_rating),
+                "memory_stability_days": (
+                    round(mastery.fsrs_stability, 1) if mastery.fsrs_stability is not None else None
+                ),
+                "next_eligible_at": mastery.next_eligible_at.isoformat(),
+                "is_due": mastery.next_eligible_at <= timezone.now(),
+            }
+        )
+    rows.sort(key=lambda r: r["next_eligible_at"])
+    return Response({"sections": rows})

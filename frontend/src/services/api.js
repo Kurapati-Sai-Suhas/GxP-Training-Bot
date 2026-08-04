@@ -113,6 +113,10 @@ export async function getRetrainingStatus() {
   return request("/attempts/retraining-status/");
 }
 
+export async function getSectionMasteryStatus() {
+  return request("/attempts/section-mastery/");
+}
+
 export async function getSopDocuments() {
   return request("/sops/documents/");
 }

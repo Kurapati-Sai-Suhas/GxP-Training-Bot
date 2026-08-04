@@ -7,11 +7,11 @@ from rest_framework.test import APITestCase
 
 from accounts.models import JobRole
 from quiz.models import Option, Question
-from sops.models import SOPDocument
+from sops.models import SOPChunk, SOPDocument
 
 from . import fsrs
-from .models import TopicMastery
-from .services import apply_elo_update
+from .models import ChunkMastery, TopicMastery
+from .services import QUESTION_K_FACTOR, apply_elo_update
 
 
 class QuizAttemptSubmitTests(APITestCase):
@@ -494,3 +494,139 @@ class AdaptiveFSRSSchedulingTests(APITestCase):
         rows = [r for r in response.data["learners"] if r["learner"] == "rohit"]
         self.assertEqual(len(rows), 1)
         self.assertIsNotNone(rows[0]["memory_stability_days"])
+
+
+class SectionMasteryTests(APITestCase):
+    """ChunkMastery tests: the actual scenario per-section tracking exists for -- a miss
+    in one section of a multi-section SOP shouldn't reset a different, already-strong
+    section's schedule, and a retest should target the specific weak section."""
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-907", version="v1.0", department="Production",
+            file="sops/sop-907.txt", status="processed",
+        )
+        self.chunk_a = SOPChunk.objects.create(sop=self.sop, section_title="Section A: Gowning", chunk_text="a")
+        self.chunk_b = SOPChunk.objects.create(sop=self.sop, section_title="Section B: Cleaning", chunk_text="b")
+
+        self.question_a = Question.objects.create(
+            sop=self.sop, job_role=self.role, source_chunk=self.chunk_a,
+            question_text="A?", explanation="Because.", status="approved",
+        )
+        self.correct_a = Option.objects.create(question=self.question_a, option_text="Right", is_correct=True)
+        self.wrong_a = Option.objects.create(question=self.question_a, option_text="Wrong", is_correct=False)
+
+        self.question_b = Question.objects.create(
+            sop=self.sop, job_role=self.role, source_chunk=self.chunk_b,
+            question_text="B?", explanation="Because.", status="approved",
+        )
+        self.correct_b = Option.objects.create(question=self.question_b, option_text="Right", is_correct=True)
+        self.wrong_b = Option.objects.create(question=self.question_b, option_text="Wrong", is_correct=False)
+
+        # No source_chunk -- exercises the "no section to attribute this to" skip path.
+        self.question_unlinked = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="U?", explanation="Because.", status="approved",
+        )
+        self.correct_unlinked = Option.objects.create(
+            question=self.question_unlinked, option_text="Right", is_correct=True
+        )
+
+        self.client.force_authenticate(user=self.learner)
+
+    def _submit(self, answers):
+        attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
+        ).data["id"]
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
+        )
+
+    def test_correct_and_wrong_sections_get_independent_chunk_mastery_rows(self):
+        self._submit([
+            {"question": self.question_a.id, "selected_option": self.correct_a.id},
+            {"question": self.question_b.id, "selected_option": self.wrong_b.id},
+        ])
+        mastery_a = ChunkMastery.objects.get(learner=self.learner, sop_chunk=self.chunk_a)
+        mastery_b = ChunkMastery.objects.get(learner=self.learner, sop_chunk=self.chunk_b)
+        self.assertEqual(mastery_a.streak_correct, 1)
+        self.assertEqual(mastery_b.streak_correct, 0)
+
+    def test_a_miss_in_one_section_does_not_reset_an_already_strong_section(self):
+        """The literal scenario this feature exists for."""
+        self._submit([{"question": self.question_a.id, "selected_option": self.correct_a.id}])
+        self._submit([{"question": self.question_a.id, "selected_option": self.correct_a.id}])
+        mastery_a_before = ChunkMastery.objects.get(learner=self.learner, sop_chunk=self.chunk_a)
+        self.assertEqual(mastery_a_before.streak_correct, 2)
+
+        # One more attempt: section A right again, section B wrong, in the SAME attempt.
+        self._submit([
+            {"question": self.question_a.id, "selected_option": self.correct_a.id},
+            {"question": self.question_b.id, "selected_option": self.wrong_b.id},
+        ])
+        mastery_a_after = ChunkMastery.objects.get(learner=self.learner, sop_chunk=self.chunk_a)
+        mastery_b_after = ChunkMastery.objects.get(learner=self.learner, sop_chunk=self.chunk_b)
+        # Section A's streak kept growing (now mastered) despite section B failing in the same attempt.
+        self.assertEqual(mastery_a_after.streak_correct, 3)
+        self.assertEqual(mastery_a_after.mastery_status, "mastered")
+        self.assertEqual(mastery_b_after.streak_correct, 0)
+
+    def test_questions_without_a_source_chunk_create_no_chunk_mastery(self):
+        self._submit([{"question": self.question_unlinked.id, "selected_option": self.correct_unlinked.id}])
+        self.assertEqual(ChunkMastery.objects.count(), 0)
+        # But the whole-SOP TopicMastery is still updated as before.
+        self.assertTrue(TopicMastery.objects.filter(learner=self.learner, sop=self.sop).exists())
+
+    def test_question_elo_rating_moves_exactly_once_per_answer_not_twice(self):
+        """Regression guard: a question linked to a chunk still only has its own
+        elo_rating nudged once per real answer (via the whole-SOP pairing) -- the
+        section-level update must be ability-only, or this would double-move it."""
+        before = self.question_a.elo_rating
+        self._submit([{"question": self.question_a.id, "selected_option": self.correct_a.id}])
+        self.question_a.refresh_from_db()
+        # A single correct answer at equal ratings (both start at 1500) moves the
+        # question down by exactly QUESTION_K_FACTOR * 0.5; if section-level tracking
+        # also moved it, this delta would be roughly doubled.
+        expected_delta = QUESTION_K_FACTOR * 0.5
+        self.assertAlmostEqual(before - self.question_a.elo_rating, expected_delta, places=2)
+
+    def test_auto_assigned_targets_unmastered_section_questions_first(self):
+        for _ in range(3):
+            self._submit([{"question": self.question_a.id, "selected_option": self.correct_a.id}])
+        self._submit([{"question": self.question_b.id, "selected_option": self.wrong_b.id}])
+
+        # Three genuine successes on section A built up real FSRS stability, so a single
+        # failure elsewhere doesn't necessarily make the whole SOP due again immediately
+        # (FSRS caps post-failure stability at the pre-failure value on purpose -- a
+        # well-established memory shouldn't collapse to daily retesting from one slip).
+        # This test is about targeting logic, not scheduling timing, so force due-ness
+        # directly rather than fighting that legitimate behavior.
+        TopicMastery.objects.filter(learner=self.learner, sop=self.sop).update(
+            next_eligible_at=timezone.now() - datetime.timedelta(days=1)
+        )
+
+        response = self.client.get("/api/attempts/auto-assigned/")
+        assignments = [a for a in response.data["assignments"] if a["sop_id"] == self.sop.id]
+        self.assertEqual(len(assignments), 1)
+        assignment = assignments[0]
+        self.assertEqual(assignment["unmastered_section_count"], 1)
+        self.assertIn(self.question_b.id, assignment["question_ids"])
+        self.assertNotIn(self.question_a.id, assignment["question_ids"])
+
+    def test_section_mastery_status_requires_reviewer_or_admin(self):
+        response = self.client.get("/api/attempts/section-mastery/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_section_mastery_status_lists_unmastered_sections_only(self):
+        for _ in range(3):
+            self._submit([{"question": self.question_a.id, "selected_option": self.correct_a.id}])
+        self._submit([{"question": self.question_b.id, "selected_option": self.wrong_b.id}])
+
+        admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
+        self.client.force_authenticate(user=admin)
+        response = self.client.get("/api/attempts/section-mastery/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        section_titles = {row["section_title"] for row in response.data["sections"]}
+        self.assertIn("Section B: Cleaning", section_titles)
+        self.assertNotIn("Section A: Gowning", section_titles)  # mastered after 3 correct in a row

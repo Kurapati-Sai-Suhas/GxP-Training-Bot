@@ -49,6 +49,7 @@ import {
   getQuestions,
   getRecommendedRefresher,
   getRetrainingStatus,
+  getSectionMasteryStatus,
   getSopDocuments,
   getStoredToken,
   login,
@@ -1651,6 +1652,28 @@ function Analytics({ summary, apiStatus, canViewRetrainingStatus }) {
     };
   }, [canViewRetrainingStatus]);
 
+  const [sectionRows, setSectionRows] = useState([]);
+  useEffect(() => {
+    if (!canViewRetrainingStatus) {
+      return;
+    }
+    let cancelled = false;
+    getSectionMasteryStatus()
+      .then((data) => {
+        if (!cancelled) {
+          setSectionRows(data.sections || []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSectionRows([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canViewRetrainingStatus]);
+
   return (
     <div className="page">
       <PageHeader
@@ -1803,6 +1826,61 @@ function Analytics({ summary, apiStatus, canViewRetrainingStatus }) {
                         {row.escalated ? (
                           <span className="badge badge--rejected">Escalated</span>
                         ) : row.is_due ? (
+                          <span className="badge badge--pending">Due Now</span>
+                        ) : (
+                          <span className="badge badge--draft">Scheduled</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {canViewRetrainingStatus && (
+        <section className="card">
+          <div className="card__title">
+            Section Mastery{" "}
+            <small>Which specific SOP section a learner is weak in, not just which whole SOP</small>
+          </div>
+          {sectionRows.length === 0 ? (
+            <p className="muted-small">No section is currently in a retraining loop.</p>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Learner</th>
+                    <th>SOP</th>
+                    <th>Section</th>
+                    <th>Box</th>
+                    <th>Streak</th>
+                    <th>Ability (Elo)</th>
+                    <th title="FSRS memory model: projected days until this learner's recall odds on this section drop to ~90% without another review">
+                      Memory Stability
+                    </th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sectionRows.map((row, idx) => (
+                    <tr key={`${row.learner}-${row.sop_code}-${row.section_title}-${idx}`}>
+                      <td className="strong-cell">{row.learner}</td>
+                      <td>{row.sop_code}</td>
+                      <td>{row.section_title}</td>
+                      <td>{row.box_index}</td>
+                      <td>{row.streak_correct}</td>
+                      <td>{row.elo_rating}</td>
+                      <td>
+                        {row.memory_stability_days === null || row.memory_stability_days === undefined
+                          ? "-"
+                          : `~${row.memory_stability_days}d`}
+                      </td>
+                      <td>
+                        {row.is_due ? (
                           <span className="badge badge--pending">Due Now</span>
                         ) : (
                           <span className="badge badge--draft">Scheduled</span>
