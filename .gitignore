@@ -12,5 +12,5 @@ frontend/package-lock.json
 frontend/*.log
 backend/*.log
 .DS_Store
-.claude/settings.local.json
+.claude/
 docs/~$*.docx
