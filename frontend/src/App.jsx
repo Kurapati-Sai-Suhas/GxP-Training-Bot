@@ -841,8 +841,13 @@ const difficultyBadge = {
 };
 
 function GenerateQuiz({ documents, jobRoles, onGenerated, onNavigate }) {
-  const sopOptions = documents?.filter((doc) => doc.status === "processed") ?? [];
-  const roleOptions = jobRoles ?? [];
+  // Memoised so the defaulting effects below depend on a stable reference. Rebuilt as a
+  // fresh array on every render, these two made those effects re-run each time.
+  const sopOptions = useMemo(
+    () => documents?.filter((doc) => doc.status === "processed") ?? [],
+    [documents],
+  );
+  const roleOptions = useMemo(() => jobRoles ?? [], [jobRoles]);
 
   const [sopId, setSopId] = useState("");
   const [roleId, setRoleId] = useState("");

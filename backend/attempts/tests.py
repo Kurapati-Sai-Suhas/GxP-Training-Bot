@@ -1097,6 +1097,45 @@ class SubmissionValidationTests(APITestCase):
         self.assertFalse(TopicMastery.objects.filter(learner=self.learner).exists())
         self.assertFalse(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).exists())
 
+    def test_duplicate_question_ids_are_rejected(self):
+        """Answering the same question repeatedly must not manufacture evidence.
+
+        Each duplicate previously became its own AttemptAnswer row, so one known question
+        submitted five times put five "correct" answers into that section's history --
+        enough to satisfy MIN_EVIDENCE on its own and to pull the recency-weighted accuracy
+        (and the section's Elo ability) up with fabricated repetitions of a single item.
+        Rejected before any write, so nothing downstream of the payload check moves.
+        """
+        for repeats in (3, 5, 10):
+            with self.subTest(repeats=repeats):
+                response = self._submit(
+                    [{"question": self.question.id, "selected_option": self.right.id}] * repeats
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(self.question.id, response.data["duplicate_question_ids"])
+                # No writes: no answers, no mastery, no Elo movement, attempt still open.
+                self.assertFalse(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).exists())
+                self.assertFalse(TopicMastery.objects.filter(learner=self.learner).exists())
+                self.assertFalse(ChunkMastery.objects.filter(learner=self.learner).exists())
+                self.assertIsNone(QuizAttempt.objects.get(id=self.attempt_id).completed_at)
+                self.question.refresh_from_db()
+                self.assertEqual(self.question.elo_rating, 1500)
+
+    def test_distinct_question_ids_are_still_accepted(self):
+        """The guard rejects repetition, not multi-question submissions."""
+        second = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q2?", explanation="B.", status="approved",
+        )
+        second_right = Option.objects.create(question=second, option_text="R", is_correct=True)
+
+        response = self._submit([
+            {"question": self.question.id, "selected_option": self.right.id},
+            {"question": second.id, "selected_option": second_right.id},
+        ])
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).count(), 2)
+
 
 class LearningPathExplainabilityTests(APITestCase):
     """The adaptive engine must be able to justify itself: every selection shown to a

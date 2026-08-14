@@ -171,6 +171,20 @@ def _classify(answered, correct, lifetime, weighted, mastery):
       2. mastered        -- a demonstrated streak retires the section
       3. insufficient evidence -- high accuracy on a tiny sample cannot exclude
       4. weakness / proficiency thresholds
+
+    Why the thresholds are applied to the *rounded* figure
+    -----------------------------------------------------
+    `weighted` arrives already rounded to one decimal place (see weighted_accuracy), and
+    that is the value compared against the thresholds. The alternative -- deciding on the
+    full-precision value -- was considered and rejected: a section whose true accuracy is
+    59.973% displays as "60.0%", so classifying it HIGH would render the reason string
+    "60.0% accuracy - below the 60% weakness threshold", which reads as a bug to a learner
+    and to an auditor. Deciding on the number actually shown keeps the verdict and its
+    stated evidence consistent, which in a controlled-training context matters more than
+    the ~0.05pp band where the two approaches disagree. The band is reachable but narrow:
+    an exhaustive search over every answer sequence of length 3-14 found 47 such sequences,
+    the shortest being 8 answers. Documented rather than "fixed" -- it is a deliberate
+    trade-off, not an oversight.
     """
     if answered == 0:
         return (

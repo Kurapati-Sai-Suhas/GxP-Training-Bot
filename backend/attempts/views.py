@@ -122,14 +122,39 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
         # Validate the submitted question ids before anything is written. Previously any id
         # was accepted, so a crafted payload could feed answers for unrelated questions --
         # or for unapproved drafts -- straight into ChunkMastery and the adaptive engine.
-        # This is a guard on the *content* of a submission; the full fix (a server-side
-        # record of which questions were actually offered) is deferred, see FUTURE_SCOPE.md.
+        #
+        # KNOWN LIMITATION -- what these checks do NOT cover:
+        # The adaptive engine's exact offered question set is not yet persisted and enforced
+        # server-side. Current validation ensures submitted questions belong to the learner's
+        # permitted SOP/role/approved pool, but a modified client can submit a different
+        # eligible question or omit questions. A future QuizAttemptQuestion model would make
+        # the adaptive decision enforceable and the attempt reproducible. See FUTURE_SCOPE.md
+        # section 1.1. Concretely, because the score is computed over *submitted* answers,
+        # omitting questions inflates it -- the honest client always submits the full offered
+        # set (frontend App.jsx sends null for unanswered questions, which grades as wrong).
         submitted_ids = [item.get("question") for item in submitted_answers]
         if any(qid is None for qid in submitted_ids):
             return response.Response(
                 {"error": "Every answer must name a question."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # A question may be answered at most once per attempt. Duplicates were previously
+        # accepted and each became its own AttemptAnswer row, so submitting one known
+        # question five times wrote five "correct" answers into that section's history --
+        # satisfying MIN_EVIDENCE with a single question and inflating both the
+        # recency-weighted accuracy the adaptive engine decides on and the section's Elo
+        # ability. Rejected here, alongside the other payload checks and before the atomic
+        # claim below, so nothing is written and the attempt stays open and retakeable.
+        if len(set(submitted_ids)) != len(submitted_ids):
+            duplicates = sorted({qid for qid in submitted_ids if submitted_ids.count(qid) > 1})
+            return response.Response(
+                {
+                    "error": "Each question may only be answered once per attempt.",
+                    "duplicate_question_ids": duplicates,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         allowed_ids = set(
             Question.objects.filter(
                 id__in=submitted_ids, sop=attempt.sop, job_role=attempt.job_role, status="approved"
