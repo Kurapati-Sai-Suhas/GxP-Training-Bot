@@ -14,3 +14,6 @@ backend/*.log
 .DS_Store
 .claude/
 docs/~$*.docx
+
+# Office lock files (created whenever a .pptx/.docx is open)
+~$*
