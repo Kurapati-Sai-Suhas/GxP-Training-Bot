@@ -2,7 +2,15 @@
 
 **Turn a pharma SOP into a role-specific, SME-approved quiz — with every AI-drafted question grounded in the source text, gated behind a human reviewer, and logged to an append-only compliance trail.**
 
-Built for NVIDIA GenAI Bootcamp, Problem Statement **PS053** (Pharma & Life Sciences — GenAI Tutor track). Backend: Django REST Framework. Frontend: React + Vite. AI: **NVIDIA NIM** (`meta/llama-3.1-8b-instruct`, plus `nvidia/nv-embedqa-e5-v5` for embeddings). Async: Celery + Redis. DB: PostgreSQL (Docker-verified). CI: GitHub Actions. **89 automated tests, 0 fabricated claims in this README** — every feature described below is either read directly from the code in this repo or verified live.
+Built for NVIDIA GenAI Bootcamp, Problem Statement **PS053** (Pharma & Life Sciences — GenAI Tutor track). Backend: Django REST Framework. Frontend: React + Vite. AI: **NVIDIA NIM** (`meta/llama-3.1-8b-instruct`, plus `nvidia/nv-embedqa-e5-v5` for embeddings). Async: Celery + Redis. DB: PostgreSQL (Docker-verified). CI: GitHub Actions. **219 automated tests, 0 fabricated claims in this README** — every feature described below is either read directly from the code in this repo or verified live.
+
+> **Engineering documentation.** This project has been through a full reverse-engineering audit
+> followed by a security and record-integrity hardening sprint. Start with
+> [`docs/SRS.md`](docs/SRS.md) (what the system actually does),
+> [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) (45 findings, honestly rated),
+> [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (what the sprint fixed, and what it deliberately
+> did not), [`docs/SECURITY.md`](docs/SECURITY.md) (implemented controls **and** residual
+> risks), [`docs/TESTING.md`](docs/TESTING.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ---
 
@@ -185,7 +193,7 @@ Every SOP upload/process/failure, every question generation/approval/rejection (
 
 ## Engineering rigor
 
-- **89 automated tests** (`accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, `audit`) — RBAC boundary tests from *both* the permitted and denied side of every gated action, electronic-signature boundary tests (missing password / wrong password), forced-offline-fallback tests for both AI generation and the SOP chatbot (CI never needs a live NVIDIA API key), adaptive-retraining scheduling tests covering box advancement, streak resets, and low-confidence-question exclusion, dedicated FSRS/Elo test suites (pure algorithm behavior plus end-to-end submission tests) covering both rating systems independently, and a section-mastery suite covering the exact scenario that feature exists for — a miss in one section not resetting an already-strong one — plus a regression guard proving a question's Elo rating moves exactly once per answer, not twice, now that two mastery tracks can both reference it.
+- **219 automated tests** (`accounts`, `sops`, `ai_engine`, `quiz`, `attempts`, `analytics`, `audit`) — including a dedicated suite proving the learner-facing API never discloses the answer key, that a completed attempt cannot be resubmitted, that approved/e-signed content is immutable, and that the signature is bound to a content hash. Both P0 fixes were verified by temporarily disabling the guard and confirming the new tests fail (see [`docs/TESTING.md`](docs/TESTING.md)). Plus RBAC boundary tests from *both* the permitted and denied side of every gated action, electronic-signature boundary tests (missing password / wrong password), forced-offline-fallback tests for both AI generation and the SOP chatbot (CI never needs a live NVIDIA API key), adaptive-retraining scheduling tests covering box advancement, streak resets, and low-confidence-question exclusion, dedicated FSRS/Elo test suites (pure algorithm behavior plus end-to-end submission tests) covering both rating systems independently, and a section-mastery suite covering the exact scenario that feature exists for — a miss in one section not resetting an already-strong one — plus a regression guard proving a question's Elo rating moves exactly once per answer, not twice, now that two mastery tracks can both reference it.
 - **Two real regression tests exist because two real bugs were found and fixed** — a stale Django `prefetch_related` cache silently returned `chunks: 0` right after chunks were successfully created (SOP processing), and the identical class of bug returned an empty `answers` array on a quiz submission that had, in fact, scored correctly. Both are now permanently covered by tests named for the bug they prevent from coming back.
 - **CI (`.github/workflows/ci.yml`)**: backend tests run against a real PostgreSQL service container, not SQLite standing in for it; frontend job runs a production Vite build.
 - **Docker Compose**, run and verified end-to-end: Postgres, Redis, a Celery worker, and the Django backend, with the NVIDIA NIM call watched live in the worker's own logs, not just asserted to work.
@@ -253,8 +261,10 @@ gxp-training-bot/
 
 ## What's next
 
-See [`ROADMAP.md`](ROADMAP.md) and Section 11 of [`docs/SRS_GxP_Training_Bot.docx`](docs/SRS_GxP_Training_Bot.docx) for the full production-readiness roadmap (secrets management, TLS, rate limiting, observability, horizontal scaling) and a designed-but-not-yet-built n8n workflow-automation integration.
+See [`ROADMAP.md`](ROADMAP.md) and [`docs/SECURITY.md`](docs/SECURITY.md) §9 for the full production-readiness roadmap (secrets management, TLS, rate limiting, observability, horizontal scaling) and a designed-but-not-yet-built n8n workflow-automation integration.
 
 Adaptive learning specifically: all three upgrades identified as worth pursuing are done — FSRS scheduling, Elo-rated difficulty/ability, and per-section mastery (see [Research foundations, entries 5 and 6](#research-foundations-what-we-read-the-gaps-we-found-and-what-we-built-because-of-them)). What's not built on top of that: `ChunkMastery` doesn't yet feed back into `TopicMastery`'s own status (e.g. surfacing "9/10 sections mastered" as a progress indicator, not just a pass/fail flag), and there's no UI yet for a learner to see their own per-section breakdown — `GET /api/attempts/section-mastery/` is Admin/SME-facing only today.
 
-Two other nearest open items in the codebase itself: a frontend test suite (backend has 89 tests, frontend has none yet), and multi-turn memory for the SOP chatbot (today it's single-turn: one question, one grounded answer).
+Two other nearest open items in the codebase itself: a frontend test suite (backend has 219 tests, frontend has none yet), and multi-turn memory for the SOP chatbot (today it's single-turn: one question, one grounded answer).
+
+The largest deferred items after the hardening sprint — SOP version lifecycle, a training assignment/completion model, and tamper-evident audit storage — are recorded with their rationale in [`docs/CHANGELOG.md`](docs/CHANGELOG.md) and [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md).

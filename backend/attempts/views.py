@@ -1,19 +1,24 @@
+from django.db import transaction
 from django.utils import timezone
-from rest_framework import decorators, permissions, response, viewsets
+from rest_framework import decorators, permissions, response, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
-from accounts.permissions import ADMIN_GROUP, IsReviewerUser
+from accounts.permissions import IsReviewerUser, is_admin
 from audit.models import log_action
 from quiz.models import Question
+from sops.models import SOPDocument
 
+from . import adaptive
 from .models import AttemptAnswer, ChunkMastery, QuizAttempt, TopicMastery
 from .serializers import AttemptAnswerSerializer, QuizAttemptSerializer
 from .services import apply_elo_update, apply_elo_update_ability_only
 
 
 def _is_admin(user):
-    return bool(user and user.is_authenticated and (user.is_staff or user.groups.filter(name=ADMIN_GROUP).exists()))
+    # Thin alias kept so this module's call sites read naturally; the single definition
+    # lives in accounts.permissions so the role test cannot drift between modules.
+    return is_admin(user)
 
 
 # A learner failing the same SOP this many times is treated as a compliance signal worth
@@ -86,7 +91,12 @@ def _retraining_pass_signal(attempt):
 
 
 class QuizAttemptViewSet(viewsets.ModelViewSet):
-    queryset = QuizAttempt.objects.select_related("learner", "job_role", "sop").prefetch_related("answers")
+    queryset = (
+        QuizAttempt.objects.select_related("learner", "job_role", "sop")
+        # answers__question__options is needed by AttemptAnswerSerializer's
+        # correct_option_text; without it the result payload is one query per answer.
+        .prefetch_related("answers__question__options", "answers__selected_option")
+    )
     serializer_class = QuizAttemptSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -109,6 +119,75 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
             )
         submitted_answers = request.data.get("answers", [])
 
+        # Validate the submitted question ids before anything is written. Previously any id
+        # was accepted, so a crafted payload could feed answers for unrelated questions --
+        # or for unapproved drafts -- straight into ChunkMastery and the adaptive engine.
+        # This is a guard on the *content* of a submission; the full fix (a server-side
+        # record of which questions were actually offered) is deferred, see FUTURE_SCOPE.md.
+        submitted_ids = [item.get("question") for item in submitted_answers]
+        if any(qid is None for qid in submitted_ids):
+            return response.Response(
+                {"error": "Every answer must name a question."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        allowed_ids = set(
+            Question.objects.filter(
+                id__in=submitted_ids, sop=attempt.sop, job_role=attempt.job_role, status="approved"
+            ).values_list("id", flat=True)
+        )
+        invalid = [qid for qid in submitted_ids if qid not in allowed_ids]
+        if invalid:
+            return response.Response(
+                {
+                    "error": (
+                        "This submission contains questions that do not belong to this quiz, "
+                        "or that are not approved."
+                    ),
+                    "invalid_question_ids": sorted(set(invalid)),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            # A completed attempt is a training record: it must not be rewritten. Claiming
+            # the attempt with a conditional UPDATE (rather than reading completed_at and
+            # then checking it) makes this safe against two concurrent submissions -- only
+            # one can match completed_at__isnull=True, so the loser is rejected instead of
+            # both proceeding to grade and the second overwriting the first. Works on every
+            # backend, including SQLite, which has no row-level locking.
+            submitted_at = timezone.now()
+            claimed = QuizAttempt.objects.filter(pk=attempt.pk, completed_at__isnull=True).update(
+                completed_at=submitted_at
+            )
+            if not claimed:
+                attempt.refresh_from_db()
+                log_action(
+                    request.user, "quiz_attempt_resubmit_blocked", attempt,
+                    summary=(
+                        f"Blocked resubmission of already-completed attempt #{attempt.id} "
+                        f"by {request.user} on {attempt.sop.sop_code}"
+                    ),
+                    details={
+                        "completed_at": attempt.completed_at.isoformat(),
+                        "existing_score": float(attempt.score),
+                    },
+                )
+                return response.Response(
+                    {
+                        "error": (
+                            "This attempt has already been submitted and cannot be submitted again. "
+                            "Start a new attempt to retake this quiz."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            attempt.completed_at = submitted_at
+            return self._grade_and_record(request, attempt, submitted_answers)
+
+    def _grade_and_record(self, request, attempt, submitted_answers):
+        """Grade the submission and update every derived record. Runs inside the caller's
+        transaction, so a failure part-way rolls back the completed_at claim too rather
+        than stranding the attempt as completed-but-ungraded."""
         AttemptAnswer.objects.filter(attempt=attempt).delete()
         correct_count = 0
         answered_questions = []  # (question, is_correct), for the Elo update below
@@ -133,8 +212,9 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
 
         total = len(submitted_answers) or 1
         attempt.score = round((correct_count / total) * 100, 2)
-        attempt.completed_at = timezone.now()
-        attempt.save(update_fields=["score", "completed_at"])
+        # completed_at was already set by the atomic claim in submit(); only the score
+        # needs writing here.
+        attempt.save(update_fields=["score"])
         log_action(
             request.user, "quiz_attempt_submitted", attempt,
             summary=f"{request.user} submitted attempt #{attempt.id} on {attempt.sop.sop_code}, score {attempt.score}%",
@@ -217,9 +297,26 @@ def auto_assigned_retraining(request):
     a pre-filled dropdown. Idempotent: re-checking this endpoint (e.g. on every page load)
     reuses the same not-yet-completed auto-assigned attempt rather than spawning a new one
     each time, so retaking the SOP later still goes through the normal Start Quiz flow."""
+    # Candidates are every SOP this learner has a mastery record for where *either* the
+    # whole-SOP schedule or any individual section's schedule is due.
+    #
+    # The whole-SOP "mastered" exclusion was removed earlier: acing one section three times
+    # flips TopicMastery to mastered, which hid the SOP entirely even when another section
+    # had never been passed. Section-level due-ness is included here for the mirror-image
+    # reason: FSRS schedules a failed section sooner than a passed one, so waiting for the
+    # whole SOP to come due delayed exactly the material the learner most needs. This is
+    # also what makes ChunkMastery.next_eligible_at consumed rather than merely computed.
+    now = timezone.now()
+    due_sop_ids = set(
+        TopicMastery.objects.filter(learner=request.user, next_eligible_at__lte=now)
+        .values_list("sop_id", flat=True)
+    )
+    due_sop_ids |= set(
+        ChunkMastery.objects.filter(learner=request.user, next_eligible_at__lte=now)
+        .values_list("sop_chunk__sop_id", flat=True)
+    )
     due = (
-        TopicMastery.objects.filter(learner=request.user, next_eligible_at__lte=timezone.now())
-        .exclude(mastery_status="mastered")
+        TopicMastery.objects.filter(learner=request.user, sop_id__in=due_sop_ids)
         .select_related("sop", "job_role")
     )
 
@@ -240,6 +337,22 @@ def auto_assigned_retraining(request):
             sop=mastery.sop, job_role=mastery.job_role, status="approved"
         ).count()
         if available_count == 0:
+            continue
+
+        # Per-section adaptive analysis decides both *whether* this SOP needs retraining and
+        # *which* questions it should cover (see attempts/adaptive.py). Computed before an
+        # attempt is created so a fully-mastered SOP produces no empty auto-assignment.
+        sections = adaptive.analyse_sections(request.user, mastery.sop, mastery.job_role)
+        topic_mastered = mastery.mastery_status == "mastered"
+        # only_available=True: the assignment engine can only hand over training whose FSRS
+        # schedule is due. Sections that are weak but not yet due are still reported by the
+        # learning path, labelled with their scheduled date -- see learning_path().
+        if not adaptive.needs_training(sections, topic_mastered=topic_mastered, only_available=True):
+            continue
+        weak_question_ids = adaptive.select_retraining_questions(
+            sections, topic_mastered=topic_mastered, only_available=True
+        )
+        if not weak_question_ids:
             continue
 
         attempt = (
@@ -279,36 +392,9 @@ def auto_assigned_retraining(request):
                     details={"failed_attempts": failed_attempts, "sop_code": mastery.sop.sop_code},
                 )
 
-        # Target the retest at the specific unmastered section(s) of this SOP first (see
-        # ChunkMastery) -- much more precise than "any question ever missed," since a
-        # one-off fluke on an otherwise-mastered section shouldn't drag the whole SOP's
-        # retest into covering material the learner has since demonstrated they know.
-        unmastered_chunk_ids = list(
-            ChunkMastery.objects.filter(learner=request.user, sop_chunk__sop=mastery.sop, job_role=mastery.job_role)
-            .exclude(mastery_status="mastered")
-            .values_list("sop_chunk_id", flat=True)
+        targeted_sections = adaptive.training_sections(
+            sections, topic_mastered=topic_mastered, only_available=True
         )
-        if unmastered_chunk_ids:
-            weak_question_ids = list(
-                Question.objects.filter(
-                    sop=mastery.sop, job_role=mastery.job_role, status="approved",
-                    source_chunk_id__in=unmastered_chunk_ids,
-                ).values_list("id", flat=True)
-            )
-        else:
-            # No section-level data yet (e.g. these questions predate chunk linkage) --
-            # fall back to the original targeting: questions this learner has actually
-            # gotten wrong before, instead of re-running the whole quiz including ones
-            # they already know cold. Falls back further to the full approved set
-            # (question_ids=[]) if there's no wrong-answer history yet either.
-            weak_question_ids = list(
-                AttemptAnswer.objects.filter(
-                    attempt__learner=request.user, attempt__sop=mastery.sop, attempt__job_role=mastery.job_role,
-                    is_correct=False, question__status="approved",
-                )
-                .values_list("question_id", flat=True)
-                .distinct()
-            )
         targeted = len(weak_question_ids) > 0
 
         assignments.append(
@@ -329,24 +415,88 @@ def auto_assigned_retraining(request):
                 "attempt_id": attempt.id,
                 "question_ids": weak_question_ids,
                 "targeted": targeted,
-                "unmastered_section_count": len(unmastered_chunk_ids),
+                "unmastered_section_count": len(targeted_sections),
+                # The full per-section breakdown travels with the assignment so the learner
+                # (and a reviewer) can see exactly why this content was chosen, rather than
+                # being handed an unexplained quiz.
+                "sections": targeted_sections,
                 "reason": (
-                    f"Due for a spaced retest (box {mastery.box_index}) under our adaptive-retraining "
-                    f"schedule — {mastery.streak_correct} correct in a row so far on this SOP."
-                    + (
-                        f" Retest focuses on {len(unmastered_chunk_ids)} unmastered section(s)."
-                        if unmastered_chunk_ids
-                        else (
-                            f" Retest focuses on the {len(weak_question_ids)} question(s) you missed before."
-                            if targeted
-                            else ""
-                        )
-                    )
+                    f"Due for a spaced retest under the adaptive schedule. "
+                    f"{adaptive.summarise(sections)}"
                 ),
             }
         )
 
     return Response({"assignments": assignments})
+
+
+@api_view(["GET"])
+@permission_classes([permissions.IsAuthenticated])
+def learning_path(request):
+    """The learner's own adaptive state, section by section, with the reasoning shown.
+
+    Answers "why am I being given this training?" -- which in a controlled-training context
+    is not a nicety: a learner (or an auditor) should be able to see that retraining was
+    driven by recorded assessment performance on specific source sections, not by an
+    unexplained black box. Every number here is measured from stored answers or from the
+    mastery state; none of it is generated for display.
+
+    Scoped to the requesting user. Covers every SOP with approved questions for their job
+    role, including ones never attempted, so genuinely untouched material is visible rather
+    than simply missing.
+    """
+    profile = getattr(request.user, "learnerprofile", None)
+    job_role = profile.job_role if profile else None
+    if job_role is None:
+        return Response(
+            {
+                "job_role": None,
+                "sops": [],
+                "message": "No job role is assigned to your profile, so no training is targeted at you yet.",
+            }
+        )
+
+    sop_ids = (
+        Question.objects.filter(job_role=job_role, status="approved")
+        .values_list("sop_id", flat=True)
+        .distinct()
+    )
+    masteries = {
+        m.sop_id: m
+        for m in TopicMastery.objects.filter(learner=request.user, sop_id__in=sop_ids)
+    }
+
+    rows = []
+    for sop in SOPDocument.objects.filter(id__in=sop_ids).order_by("sop_code"):
+        sections = adaptive.analyse_sections(request.user, sop, job_role)
+        mastery = masteries.get(sop.id)
+        topic_mastered = mastery is not None and mastery.mastery_status == "mastered"
+        # Two distinct counts, deliberately. `needing_training` is the adaptive verdict
+        # ("what"); `available_now` is what FSRS currently permits ("when"). Reporting only
+        # the first is what produced a recommendation the learner could not act on.
+        selected = adaptive.training_sections(sections, topic_mastered=topic_mastered)
+        available = adaptive.training_sections(
+            sections, topic_mastered=topic_mastered, only_available=True
+        )
+        rows.append(
+            {
+                "sop_id": sop.id,
+                "sop_code": sop.sop_code,
+                "sop_title": sop.title,
+                "overall_status": mastery.mastery_status if mastery else "not_started",
+                "overall_elo_rating": round(mastery.elo_rating) if mastery else None,
+                "next_eligible_at": mastery.next_eligible_at.isoformat() if mastery else None,
+                "is_due": (
+                    mastery.next_eligible_at <= timezone.now() if mastery else True
+                ),
+                "sections": sections,
+                "sections_needing_training": len(selected),
+                "sections_available_now": len(available),
+                "summary": adaptive.summarise(sections),
+            }
+        )
+
+    return Response({"job_role": job_role.name, "sops": rows})
 
 
 @api_view(["GET"])

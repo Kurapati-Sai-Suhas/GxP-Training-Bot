@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from pathlib import Path
@@ -5,6 +6,8 @@ from pathlib import Path
 import fitz
 from docx import Document
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 HEADING_PATTERN = re.compile(
     r"^(?:(?:section|chapter|part|appendix)\s+\d+\b|\d+(?:\.\d+)*[.)])\s*\S.*$",
@@ -97,7 +100,16 @@ def _chunk_by_semantic_similarity(lines, max_chars):
     """
     try:
         embeddings = _embed_sentences(lines)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - cascade falls through to fixed-length splitting
+        from ai_engine.services import classify_llm_error
+
+        logger.warning(
+            "Semantic chunking unavailable (%s): %s. Falling back to fixed-length splitting; "
+            "affected chunks are recorded with chunking_strategy='fixed_length'.",
+            classify_llm_error(exc), exc,
+            extra={"provider": "nvidia_nim", "model": NVIDIA_EMBED_MODEL,
+                   "error_category": classify_llm_error(exc), "fallback_used": True},
+        )
         return None
 
     chunks = []

@@ -1325,3 +1325,82 @@ button:disabled {
 .dropdown-panel__item + .dropdown-panel__item {
   border-top: 1px solid var(--color-border);
 }
+
+/* --- Learning path (adaptive explainability) ------------------------------------- */
+.path-section {
+  border: 1px solid var(--color-border);
+  border-left: 4px solid var(--color-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: #fff;
+}
+
+/* Priority is carried by the left border as well as the badge, so the scan-read of a
+   long list doesn't depend on reading every label. */
+.path-section--high { border-left-color: #DC2626; }
+.path-section--medium { border-left-color: #D97706; }
+.path-section--low { border-left-color: #16A34A; }
+.path-section--none { border-left-color: #2563EB; }
+
+.path-section__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.path-section__mark {
+  font-size: 15px;
+  font-weight: 700;
+  color: #64748B;
+}
+
+.path-section__metrics {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: #475569;
+  margin-bottom: 6px;
+}
+
+.path-section__reason {
+  font-size: 13px;
+  color: #64748B;
+  font-style: italic;
+}
+
+/* --- Reviewer source provenance ---------------------------------------------------- */
+.source-provenance {
+  margin: 8px 0 10px;
+  font-size: 13px;
+}
+
+.source-provenance summary {
+  cursor: pointer;
+  color: #1D4ED8;
+  font-weight: 600;
+}
+
+.source-provenance blockquote {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid #CBD5E1;
+  background: #F8FAFC;
+  color: #334155;
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* Learning gain: the visible proof that the adaptive loop closed. */
+.path-section__gain {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.path-section__gain.up { color: #16A34A; }
+.path-section__gain.down { color: #DC2626; }

@@ -1,3 +1,7 @@
+import hashlib
+import json
+
+from django.conf import settings
 from django.db import models
 
 from accounts.models import JobRole
@@ -50,6 +54,21 @@ class Question(models.Model):
     # from real learner answers. Defaults to 1500 (the "medium" seed) so any Question
     # created without going through save()'s seeding below still gets a neutral prior.
     elo_rating = models.FloatField(default=1500)
+    # --- Electronic-signature binding (21 CFR Part 11-style control) -------------------
+    # Recording only "someone approved this" is not enough to reconstruct what was approved:
+    # if the text is edited afterwards, the signature silently comes to vouch for content
+    # the reviewer never saw. content_hash pins the signature to the exact wording, options,
+    # and answer key that existed at approval time, so a later divergence is detectable
+    # rather than invisible. Null until the question is first approved.
+    content_hash = models.CharField(max_length=64, null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_questions",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -63,6 +82,38 @@ class Question(models.Model):
         if self._state.adding and self.elo_rating == self._meta.get_field("elo_rating").get_default():
             self.elo_rating = self.DIFFICULTY_SEED_ELO.get(self.difficulty, self.elo_rating)
         super().save(*args, **kwargs)
+
+    def compute_content_hash(self):
+        """Deterministic SHA-256 over everything a reviewer is actually approving: the
+        question wording, the explanation, the difficulty, and the full option set
+        including which one is correct.
+
+        Ordered by option id and serialised with sorted keys and fixed separators so the
+        same content always produces the same digest -- otherwise the hash would depend on
+        dict ordering or queryset iteration order and would compare unequal against itself.
+        """
+        payload = {
+            "question_text": self.question_text,
+            "explanation": self.explanation,
+            "difficulty": self.difficulty,
+            "options": [
+                {"option_text": option.option_text, "is_correct": option.is_correct}
+                for option in self.options.order_by("id")
+            ],
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def signature_is_intact(self):
+        """Whether this question's current content still matches what was signed.
+
+        False means the content changed after approval -- which the edit lock is designed
+        to prevent, so this is a detection backstop for anything that bypasses the API
+        (direct ORM access, the admin site, a data migration).
+        """
+        if not self.content_hash:
+            return None  # never approved: nothing to verify against
+        return self.content_hash == self.compute_content_hash()
 
     def __str__(self):
         return self.question_text[:80]

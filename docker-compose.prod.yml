@@ -1,0 +1,123 @@
+# PRODUCTION-SHAPED stack: DEBUG off, gunicorn, secrets required from the host
+# environment, secure cookies, no unauthenticated media route.
+#
+#   docker compose -f docker-compose.prod.yml up --build
+#
+# Required host environment variables (compose fails fast with the message shown if any is
+# missing -- that is deliberate, so a misconfigured deploy cannot start in a weak state):
+#   SECRET_KEY, POSTGRES_PASSWORD, ALLOWED_HOSTS, CORS_ALLOWED_ORIGINS, NVIDIA_API_KEY
+#
+# Still NOT included, and required before this faces real users: TLS termination, a
+# managed secrets store, backups, and log shipping. See docs/DEPLOYMENT.md.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gxp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-gxp_training_bot}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gxp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DEBUG: "False"
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set to a unique value}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:?ALLOWED_HOSTS must list explicit hostnames}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-}
+      DATABASE_URL: postgres://${POSTGRES_USER:-gxp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gxp_training_bot}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "False"
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      # This stack terminates TLS at an upstream proxy, so Django must not also redirect.
+      # Set SECURE_SSL_REDIRECT=True and USE_X_FORWARDED_PROTO=True once that proxy is in
+      # front of it.
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-False}
+      USE_X_FORWARDED_PROTO: ${USE_X_FORWARDED_PROTO:-False}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - media_data:/app/media
+    # Migrate, then hand off to the image's gunicorn CMD.
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             exec gunicorn config.wsgi:application
+               --bind 0.0.0.0:8000
+               --workers ${GUNICORN_WORKERS:-3}
+               --timeout 180
+               --access-logfile -
+               --error-logfile -"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,urllib.error;\nimport sys\ntry: urllib.request.urlopen('http://127.0.0.1:8000/api/accounts/me/')\nexcept urllib.error.HTTPError: sys.exit(0)\nexcept Exception: sys.exit(1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  celery-worker:
+    build: ./backend
+    environment:
+      DEBUG: "False"
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set to a unique value}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:?ALLOWED_HOSTS must list explicit hostnames}
+      DATABASE_URL: postgres://${POSTGRES_USER:-gxp}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-gxp_training_bot}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CELERY_TASK_ALWAYS_EAGER: "False"
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    command: celery -A config worker --loglevel=info
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?VITE_API_BASE_URL must point at the public API URL}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  media_data:

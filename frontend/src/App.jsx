@@ -23,6 +23,7 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Target,
   Trash2,
   Upload,
   UploadCloud,
@@ -39,12 +40,14 @@ import {
   createSopDocument,
   deleteSopDocument,
   downloadAuditLogCsv,
+  fetchSopFileBlob,
   generateQuiz,
   getApprovedQuestionsForRole,
   getAutoAssignedRetraining,
   getDashboardSummary,
   getJobRoles,
   getLearnerProfiles,
+  getLearningPath,
   getMe,
   getQuestions,
   getRecommendedRefresher,
@@ -67,6 +70,7 @@ const navigation = [
   { id: "generate-quiz", label: "Generate Quiz", icon: Sparkles, requires: "is_admin" },
   { id: "question-review", label: "Question Review", icon: CheckSquare, requires: "is_reviewer" },
   { id: "learner-quiz", label: "Learner Quiz", icon: GraduationCap },
+  { id: "learning-path", label: "My Learning Path", icon: Target },
   { id: "analytics", label: "Analytics", icon: BarChart3 },
   { id: "users", label: "Users & Roles", icon: Users },
 ];
@@ -77,6 +81,7 @@ const pageTitles = {
   "generate-quiz": "Generate Quiz",
   "question-review": "Question Review",
   "learner-quiz": "Learner Quiz",
+  "learning-path": "My Learning Path",
   analytics: "Analytics",
   users: "Users & Roles",
 };
@@ -514,19 +519,37 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
   const [rowError, setRowError] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
 
-  function handleView(item) {
-    if (!item.file) return;
-    window.open(item.file, "_blank", "noopener,noreferrer");
+  async function handleView(item) {
+    if (!item.downloadUrl) return;
+    setRowError(null);
+    try {
+      const blob = await fetchSopFileBlob(item.id);
+      const url = window.URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener,noreferrer");
+      // The tab needs the object URL to survive its own load, so this cannot be revoked
+      // synchronously; 60s is comfortably longer than any browser takes to read it.
+      setTimeout(() => window.URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      setRowError(err.message || "Could not open this SOP.");
+    }
   }
 
-  function handleDownload(item) {
-    if (!item.file) return;
-    const link = document.createElement("a");
-    link.href = item.file;
-    link.download = "";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+  async function handleDownload(item) {
+    if (!item.downloadUrl) return;
+    setRowError(null);
+    try {
+      const blob = await fetchSopFileBlob(item.id);
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${item.code}-${item.version}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setRowError(err.message || "Could not download this SOP.");
+    }
   }
 
   async function handleDelete(item) {
@@ -580,7 +603,7 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
         version: item.version,
         status: item.status_label,
         date: new Date(item.created_at).toISOString().slice(0, 10),
-        file: item.file,
+        downloadUrl: item.download_url,
         isLive: true,
       }))
     : fallbackSops;
@@ -762,7 +785,7 @@ function SopLibrary({ documents, apiStatus, canUpload, onUploaded }) {
 
       <section className="card section-gap">
         <div className="card__title">
-          Ask About an SOP <small>Answers grounded in that SOP's own text</small>
+          Ask About an SOP <small>Answers grounded in that SOP&apos;s own text</small>
         </div>
         {askableSops.length === 0 ? (
           <p className="muted-small">No processed SOPs yet — process one before asking questions about it.</p>
@@ -1021,6 +1044,8 @@ function QuestionReview({ questions, apiStatus, canReview, canEdit, onApproveQue
         role: item.job_role_name,
         difficulty: titleCase(item.difficulty),
         source: `${item.sop_code} · ${item.source_section || item.sop_title || "SOP source"}`,
+        sourceText: item.source_text,
+        chunkingStrategy: item.chunking_strategy,
         options: item.options.map((option) => option.option_text),
         correct: Math.max(0, item.options.findIndex((option) => option.is_correct)),
         explanation: item.explanation,
@@ -1118,6 +1143,16 @@ function QuestionReview({ questions, apiStatus, canReview, canEdit, onApproveQue
 
           <div className="q-card__question">{item.question}</div>
           <div className="q-card__source"><strong>Source:</strong> {item.source}</div>
+          {/* Provenance: a reviewer cannot judge whether an AI-drafted question is faithful
+              to the procedure without reading the passage it was generated from. */}
+          {item.sourceText && (
+            <details className="source-provenance">
+              <summary>
+                View source text{item.chunkingStrategy ? ` (${item.chunkingStrategy} chunking)` : ""}
+              </summary>
+              <blockquote>{item.sourceText}</blockquote>
+            </details>
+          )}
           <OptionList options={item.options} correct={item.correct} />
           <div className="q-card__explanation"><strong>Explanation:</strong> {item.explanation}</div>
 
@@ -1197,8 +1232,8 @@ function QuestionReview({ questions, apiStatus, canReview, canEdit, onApproveQue
           <div className="esign-modal">
             <h3>Edit Question</h3>
             <p className="muted-small">
-              Editing is only available before a question is approved — an approved question's content is locked in
-              by its electronic signature.
+              Editing is only available before a question is approved — an approved question&apos;s content is locked
+              in by its electronic signature.
             </p>
             <label className="field">
               <span>Question text</span>
@@ -1451,11 +1486,12 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
           </div>
 
           <div className="card__title">Review</div>
+          {/* Correctness, the correct answer, and the explanation all come from the submit
+              response, not from the question payload: the learner-facing question API
+              deliberately withholds them so the quiz cannot be read ahead in devtools. */}
           {attempt.questions.map((question, questionIndex) => {
             const answer = result.answers.find((item) => item.question === question.id);
             const isCorrect = Boolean(answer?.is_correct);
-            const selectedOption = question.options.find((option) => option.id === answer?.selected_option);
-            const correctOption = question.options.find((option) => option.is_correct);
             return (
               <div className="result-review" key={question.id}>
                 <div className="result-review__question">
@@ -1464,9 +1500,9 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
                 </div>
                 {!isCorrect && (
                   <div className="result-review__details">
-                    <div>Your answer: <span className="text-error">{selectedOption?.option_text || "Not answered"}</span></div>
-                    <div>Correct answer: <span className="text-success">{correctOption?.option_text}</span></div>
-                    <p>{question.explanation}</p>
+                    <div>Your answer: <span className="text-error">{answer?.selected_option_text || "Not answered"}</span></div>
+                    <div>Correct answer: <span className="text-success">{answer?.correct_option_text}</span></div>
+                    <p>{answer?.explanation}</p>
                   </div>
                 )}
               </div>
@@ -1898,6 +1934,223 @@ function Analytics({ summary, apiStatus, canViewRetrainingStatus }) {
   );
 }
 
+const priorityMeta = {
+  high: { label: "Needs Review", badge: "badge badge--failed", mark: "⚠" },
+  medium: { label: "Below Pass Mark", badge: "badge badge--pending", mark: "⚠" },
+  low: { label: "Strong", badge: "badge badge--processed", mark: "✓" },
+  none: { label: "Mastered", badge: "badge badge--approved", mark: "✓" },
+};
+
+function formatDate(iso) {
+  return iso ? new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" }) : null;
+}
+
+function SectionCard({ section }) {
+  const meta = priorityMeta[section.priority] || priorityMeta.low;
+  const neverAssessed = section.answered === 0;
+  const improved = typeof section.improvement === "number" && section.improvement > 0;
+  const declined = typeof section.improvement === "number" && section.improvement < 0;
+
+  return (
+    <div className={`path-section path-section--${section.priority}`}>
+      <div className="path-section__head">
+        <span className="path-section__mark">{neverAssessed ? "○" : meta.mark}</span>
+        <strong>{section.section_title}</strong>
+        <span className={meta.badge}>{neverAssessed ? "Not Yet Assessed" : meta.label}</span>
+        {section.selected_for_retraining && (
+          <span className="badge badge--rejected">Priority: {section.priority.toUpperCase()}</span>
+        )}
+        {/* WHAT the adaptive engine wants trained vs WHEN FSRS permits it. Showing only
+            the first is what previously produced a recommendation the learner could not
+            act on -- "Recommended: CAPA" leading to an empty quiz screen. */}
+        {section.selected_for_retraining && (
+          section.available_now ? (
+            <span className="badge badge--processed">Available now</span>
+          ) : (
+            <span className="badge badge--draft">
+              Scheduled for {formatDate(section.next_eligible_at) || "later"}
+            </span>
+          )
+        )}
+      </div>
+
+      {/* Only metrics the adaptive engine actually measures are shown. A section with no
+          answers has no accuracy -- that is displayed as "not yet assessed", never as 0%,
+          which would wrongly read as failure. */}
+      <div className="path-section__metrics">
+        {neverAssessed ? (
+          <span className="muted-small">No assessment data yet</span>
+        ) : (
+          <>
+            {/* The weighted figure is labelled as the deciding one, so the display can
+                never appear to contradict the priority beside it. */}
+            <span title="Recency-weighted accuracy — the figure the priority is decided on">
+              Adaptive score: <strong>{section.weighted_accuracy}%</strong>
+            </span>
+            <span>Lifetime: <strong>{section.accuracy}%</strong></span>
+            {section.recent_accuracy !== null && (
+              <span>Recent {section.answered < 5 ? section.answered : 5}: <strong>{section.recent_accuracy}%</strong></span>
+            )}
+            <span>Answered: <strong>{section.correct}/{section.answered}</strong></span>
+            {section.elo_rating !== null && <span>Ability: <strong>{section.elo_rating}</strong></span>}
+            {section.memory_stability_days !== null && (
+              <span title="FSRS: projected days until recall odds fall to ~90%">
+                Memory: <strong>~{section.memory_stability_days}d</strong>
+              </span>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Learning gain: the proof that the adaptive loop actually closed. Computed from
+          stored answers (oldest half vs newest half), never fabricated. */}
+      {(improved || declined) && (
+        <div className={`path-section__gain${improved ? " up" : " down"}`}>
+          {improved ? "▲" : "▼"} {section.initial_accuracy}% → {section.current_accuracy}%
+          {" "}({improved ? "+" : ""}{section.improvement} points since this section was first assessed)
+        </div>
+      )}
+
+      <div className="path-section__reason">{section.reason}</div>
+    </div>
+  );
+}
+
+// No currentUser prop: the endpoint is scoped to request.user server-side, so the component
+// must not be able to ask for anyone else's path.
+function LearningPath() {
+  const [path, setPath] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getLearningPath()
+      .then((data) => !cancelled && setPath(data))
+      .catch((err) => !cancelled && setError(err.message || "Could not load your learning path."))
+      .finally(() => !cancelled && setIsLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (isLoading) {
+    return (
+      <div className="page">
+        <PageHeader title="My Learning Path" subtitle="Loading your adaptive training state..." />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="page">
+        <PageHeader title="My Learning Path" />
+        <section className="card"><p className="text-error">{error}</p></section>
+      </div>
+    );
+  }
+
+  if (!path?.job_role) {
+    return (
+      <div className="page">
+        <PageHeader
+          title="My Learning Path"
+          subtitle="Your account has no job role assigned yet, so no training is targeted at you."
+        />
+        <section className="card">
+          <p className="muted-small">
+            Ask an admin to link a job role to your profile in Users &amp; Roles.
+          </p>
+        </section>
+      </div>
+    );
+  }
+
+  const allSections = path.sops.flatMap((sop) =>
+    sop.sections.map((section) => ({ ...section, sop_code: sop.sop_code }))
+  );
+  // Split by availability, not just by priority. "Available now" is what the learner can
+  // actually start; "scheduled" is weak material FSRS is deliberately holding back. Listing
+  // both under one heading is what let the UI promise a quiz that did not exist.
+  const availableNow = allSections.filter((s) => s.available_now);
+  const scheduled = allSections.filter((s) => s.selected_for_retraining && !s.available_now);
+
+  return (
+    <div className="page">
+      <PageHeader
+        title="My Learning Path"
+        subtitle={`Adaptive training for ${path.job_role} — every recommendation below is derived from your recorded assessment performance.`}
+      />
+
+      <section className="card section-gap">
+        <div className="card__title">
+          Recommended Next <small>Selected by the adaptive engine · available now</small>
+        </div>
+        {availableNow.length > 0 ? (
+          <ul className="weak-list">
+            {availableNow.slice(0, 5).map((section) => (
+              <li key={`${section.sop_code}-${section.chunk_id}`}>
+                <strong>{section.sop_code} · {section.section_title}</strong>
+                <span>{section.reason}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted-small">
+            {scheduled.length > 0
+              ? "Nothing is due right now. The sections below are flagged for review and are scheduled — spaced repetition holds material back until revisiting it is most effective."
+              : "Nothing is currently targeted for retraining — every section with approved questions is either mastered or performing above the pass mark."}
+          </p>
+        )}
+      </section>
+
+      {scheduled.length > 0 && (
+        <section className="card section-gap">
+          <div className="card__title">
+            Scheduled for Later <small>Flagged as weak, not yet due for review</small>
+          </div>
+          <ul className="weak-list">
+            {scheduled.slice(0, 5).map((section) => (
+              <li key={`${section.sop_code}-${section.chunk_id}`}>
+                <strong>{section.sop_code} · {section.section_title}</strong>
+                <span>
+                  Due {formatDate(section.next_eligible_at) || "later"} — {section.reason}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {path.sops.map((sop) => (
+        <section className="card section-gap" key={sop.sop_id}>
+          <div className="card__title">
+            {sop.sop_code} — {sop.sop_title}{" "}
+            <small>
+              {sop.sections_needing_training > 0
+                ? `${sop.sections_needing_training} section(s) need review · ${sop.sections_available_now} available now`
+                : "no retraining scheduled"}
+            </small>
+          </div>
+          <p className="muted-small" style={{ marginBottom: "10px" }}>{sop.summary}</p>
+          {sop.sections.map((section) => (
+            <SectionCard key={section.chunk_id ?? "unlinked"} section={section} />
+          ))}
+        </section>
+      ))}
+
+      {path.sops.length === 0 && (
+        <section className="card">
+          <p className="muted-small">
+            No approved training content exists for {path.job_role} yet. Check back after QA review.
+          </p>
+        </section>
+      )}
+    </div>
+  );
+}
+
 function UsersRoles({ jobRoles, learnerProfiles }) {
   const roleCounts = useMemo(() => {
     const counts = new Map();
@@ -2278,6 +2531,7 @@ function App() {
       />
     ),
     "learner-quiz": <LearnerQuiz currentUser={currentUser} onSubmitted={refreshAfterAttempt} />,
+    "learning-path": <LearningPath />,
     analytics: <Analytics apiStatus={apiStatus} summary={summary} canViewRetrainingStatus={roles.is_admin || roles.is_reviewer} />,
     users: <UsersRoles jobRoles={jobRoles} learnerProfiles={learnerProfiles} />,
   }[effectivePage];

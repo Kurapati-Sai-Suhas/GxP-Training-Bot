@@ -10,13 +10,20 @@ class AuditLog(models.Model):
         ("sop_uploaded", "SOP Uploaded"),
         ("sop_processed", "SOP Processed"),
         ("sop_process_failed", "SOP Processing Failed"),
+        ("sop_updated", "SOP Metadata Updated"),
+        ("sop_deleted", "SOP Deleted"),
         ("questions_generated", "Questions Generated"),
+        ("question_edited", "Question Edited"),
+        ("question_deleted", "Question Deleted"),
         ("question_approved", "Question Approved"),
         ("question_rejected", "Question Rejected"),
         ("quiz_attempt_submitted", "Quiz Attempt Submitted"),
+        ("quiz_attempt_resubmit_blocked", "Quiz Attempt Resubmission Blocked"),
         ("sop_chat_query", "SOP Chat Query"),
         ("quiz_attempt_auto_assigned", "Quiz Attempt Auto-Assigned"),
         ("retraining_escalation", "Retraining Escalation"),
+        ("job_role_changed", "Job Role Changed"),
+        ("learner_profile_changed", "Learner Profile Changed"),
     ]
 
     user = models.ForeignKey(

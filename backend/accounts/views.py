@@ -2,9 +2,12 @@ from django.contrib.auth import authenticate
 from rest_framework import decorators, permissions, response, status, viewsets
 from rest_framework.authtoken.models import Token
 
+from audit.models import log_action
+
 from .models import JobRole, LearnerProfile
 from .permissions import ADMIN_GROUP, SME_GROUP, IsAdminUser
 from .serializers import JobRoleSerializer, LearnerProfileSerializer
+from .throttling import LoginRateThrottle
 
 
 class JobRoleViewSet(viewsets.ModelViewSet):
@@ -16,6 +19,33 @@ class JobRoleViewSet(viewsets.ModelViewSet):
             return [IsAdminUser()]
         return [permissions.IsAuthenticated()]
 
+    def perform_create(self, serializer):
+        role = serializer.save()
+        log_action(
+            self.request.user, "job_role_changed", role,
+            summary=f"Created job role {role.name} ({role.department})",
+            details={"operation": "create", "name": role.name, "department": role.department},
+        )
+
+    def perform_update(self, serializer):
+        before = {"name": serializer.instance.name, "department": serializer.instance.department}
+        role = serializer.save()
+        log_action(
+            self.request.user, "job_role_changed", role,
+            summary=f"Updated job role {role.name} ({role.department})",
+            details={"operation": "update", "previous": before},
+        )
+
+    def perform_destroy(self, instance):
+        # Logged before the delete: afterwards the row (and its name) is gone, and the
+        # cascade takes every Question and QuizAttempt attached to this role with it.
+        log_action(
+            self.request.user, "job_role_changed", instance,
+            summary=f"Deleted job role {instance.name} ({instance.department})",
+            details={"operation": "delete", "name": instance.name, "department": instance.department},
+        )
+        instance.delete()
+
 
 class LearnerProfileViewSet(viewsets.ModelViewSet):
     queryset = LearnerProfile.objects.select_related("user", "job_role").all()
@@ -25,6 +55,42 @@ class LearnerProfileViewSet(viewsets.ModelViewSet):
         if self.action in ("create", "update", "partial_update", "destroy"):
             return [IsAdminUser()]
         return [permissions.IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        profile = serializer.save()
+        log_action(
+            self.request.user, "learner_profile_changed", profile,
+            summary=f"Created learner profile for {profile.user.get_username()}",
+            details={
+                "operation": "create",
+                "learner": profile.user.get_username(),
+                "job_role": profile.job_role.name if profile.job_role else None,
+            },
+        )
+
+    def perform_update(self, serializer):
+        # Which job role a learner holds decides which training they are shown, so a
+        # change here is a training-record-relevant event, not just profile admin.
+        previous_role = serializer.instance.job_role.name if serializer.instance.job_role else None
+        profile = serializer.save()
+        log_action(
+            self.request.user, "learner_profile_changed", profile,
+            summary=f"Updated learner profile for {profile.user.get_username()}",
+            details={
+                "operation": "update",
+                "learner": profile.user.get_username(),
+                "previous_job_role": previous_role,
+                "job_role": profile.job_role.name if profile.job_role else None,
+            },
+        )
+
+    def perform_destroy(self, instance):
+        log_action(
+            self.request.user, "learner_profile_changed", instance,
+            summary=f"Deleted learner profile for {instance.user.get_username()}",
+            details={"operation": "delete", "learner": instance.user.get_username()},
+        )
+        instance.delete()
 
 
 def _serialize_current_user(user):
@@ -57,6 +123,7 @@ def _serialize_current_user(user):
 
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
+@decorators.throttle_classes([LoginRateThrottle])
 def login_view(request):
     username = request.data.get("username")
     password = request.data.get("password")

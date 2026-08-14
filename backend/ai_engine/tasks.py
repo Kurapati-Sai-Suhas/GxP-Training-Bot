@@ -1,3 +1,5 @@
+import re
+
 from celery import shared_task
 
 from audit.models import log_action
@@ -10,6 +12,74 @@ from .services import answer_sop_question, generate_questions
 
 def _normalize(text):
     return " ".join(text.split()).strip().lower()
+
+
+# --- Near-duplicate detection ---------------------------------------------------------
+# Exact-signature matching only catches a verbatim repeat. In practice the model rewords:
+# "What must be done before batch release?" and "Prior to batch release, what is required?"
+# are different signatures and the same question, and both would reach the review queue.
+#
+# Similarity is token-set Jaccard over significant words, deliberately not embeddings: an
+# embedding call per candidate would add latency and cost to every generation run, and
+# would make de-duplication depend on the provider being reachable -- which the whole
+# pipeline is designed not to require. Lexical overlap is weaker, but it is free,
+# deterministic, offline, and catches the rewording the model actually does.
+_DUPLICATE_WORD_PATTERN = re.compile(r"[a-zA-Z]{3,}")
+# Words too common in this domain to carry meaning; without these, any two questions about
+# the same SOP look similar simply because both say "must", "SOP", "procedure".
+_DUPLICATE_STOPWORDS = frozenset({
+    "the", "and", "for", "are", "was", "when", "what", "which", "who", "how", "why", "does",
+    "did", "must", "should", "shall", "can", "may", "with", "from", "that", "this", "these",
+    "those", "have", "has", "had", "not", "any", "all", "per", "into", "onto", "before",
+    "after", "during", "sop", "procedure", "following", "requirement", "requirements",
+})
+# The two thresholds are deliberately asymmetric, because the two fields carry different
+# information:
+#
+#   The CORRECT ANSWER identifies *which fact* is being tested. Two questions with the same
+#   correct answer are testing the same thing however differently they are phrased, so this
+#   is the strong signal and takes the high bar.
+#
+#   The STEM confirms it is the same *subject matter*. Rewording mangles the stem badly --
+#   "What must be done before batch release?" and "Prior to batch release, what is
+#   required?" share only two significant words (0.40 overlap) despite being the same
+#   question. A high stem bar would therefore miss exactly the case exact matching already
+#   misses, so it takes the low bar and acts as a guard rather than a test.
+#
+# Requiring both is what suppresses false positives: two questions drawn from one short
+# chunk often share stem vocabulary while testing different facts, and those differ in
+# their correct answers.
+DUPLICATE_ANSWER_THRESHOLD = 0.8
+DUPLICATE_STEM_THRESHOLD = 0.4
+
+
+def _significant_tokens(text):
+    return {
+        word.lower()
+        for word in _DUPLICATE_WORD_PATTERN.findall(text or "")
+        if word.lower() not in _DUPLICATE_STOPWORDS
+    }
+
+
+def token_similarity(first, second):
+    """Jaccard overlap of significant tokens: |A ∩ B| / |A ∪ B|, in [0, 1]."""
+    a = _significant_tokens(first)
+    b = _significant_tokens(second)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def is_near_duplicate(question_text, correct_text, existing_pairs):
+    """Whether this draft restates an existing question: same fact (answer), same subject
+    (stem). See the threshold constants above for why the two bars differ."""
+    for existing_question, existing_correct in existing_pairs:
+        if (
+            token_similarity(correct_text, existing_correct) >= DUPLICATE_ANSWER_THRESHOLD
+            and token_similarity(question_text, existing_question) >= DUPLICATE_STEM_THRESHOLD
+        ):
+            return True
+    return False
 
 
 @shared_task
@@ -31,9 +101,11 @@ def generate_quiz_task(sop_id, job_role_id, count, user_id=None):
     skipped_duplicates = 0
 
     existing_signatures = set()
+    existing_pairs = []  # (question_text, correct_text) for near-duplicate comparison
     for existing in Question.objects.filter(sop=sop, job_role=job_role).prefetch_related("options"):
         correct_text = next((o.option_text for o in existing.options.all() if o.is_correct), "")
         existing_signatures.add((_normalize(existing.question_text), _normalize(correct_text)))
+        existing_pairs.append((existing.question_text, correct_text))
 
     base, remainder = divmod(count, len(chunks))
     for chunk_index, chunk in enumerate(chunks):
@@ -45,10 +117,14 @@ def generate_quiz_task(sop_id, job_role_id, count, user_id=None):
         for draft in drafts:
             correct_text = draft["options"][draft["correct_option_index"]]
             signature = (_normalize(draft["question_text"]), _normalize(correct_text))
-            if signature in existing_signatures:
+            # Exact signature first (cheap), then lexical near-duplicate (catches rewording).
+            if signature in existing_signatures or is_near_duplicate(
+                draft["question_text"], correct_text, existing_pairs
+            ):
                 skipped_duplicates += 1
                 continue
             existing_signatures.add(signature)
+            existing_pairs.append((draft["question_text"], correct_text))
 
             question = Question.objects.create(
                 sop=sop,

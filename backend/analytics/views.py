@@ -6,14 +6,28 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import is_reviewer
 from attempts.models import AttemptAnswer, QuizAttempt, TopicMastery
 from quiz.models import Question
 from sops.models import SOPDocument
 
 
 @api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def dashboard_summary(request):
+    """Organisation-wide training metrics.
+
+    Named personal data (learner_progress) is scoped to the requesting user unless they
+    hold a reviewer/admin role. Previously this endpoint declared no permission class at
+    all, so it inherited the global IsAuthenticated default and returned every learner's
+    name, job role, SOP, score, and pass/fail status to any authenticated caller --
+    including their peers. Aggregates that carry no identity (counts, role averages, weak
+    topics) stay visible to everyone, since they are what makes the dashboard useful to a
+    learner at all.
+    """
+    can_see_all_learners = is_reviewer(request.user)
     attempts = QuizAttempt.objects.select_related("learner", "job_role", "sop").order_by("-started_at")
+    visible_attempts = attempts if can_see_all_learners else attempts.filter(learner=request.user)
     total_attempts = attempts.count()
     completed_attempts = attempts.exclude(completed_at__isnull=True).count()
     completion_rate = round((completed_attempts / total_attempts) * 100, 1) if total_attempts else 0
@@ -38,7 +52,7 @@ def dashboard_summary(request):
     ]
 
     learner_progress = []
-    for attempt in attempts[:8]:
+    for attempt in visible_attempts[:8]:
         learner_progress.append(
             {
                 "learner": attempt.learner.get_full_name() or attempt.learner.username,

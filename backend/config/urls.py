@@ -1,5 +1,3 @@
-from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
@@ -15,5 +13,8 @@ urlpatterns = [
     path("api/audit/", include("audit.urls")),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# MEDIA_URL is deliberately NOT served here. django.conf.urls.static.static() serves the
+# media directory with no authentication whatsoever, and it activates whenever DEBUG is
+# true -- which the Docker stack sets -- so every uploaded SOP was publicly downloadable by
+# URL. Uploaded files are now served only through
+# GET /api/sops/documents/{id}/download/, which sits behind the normal API authentication.

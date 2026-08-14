@@ -144,6 +144,150 @@ class SopProcessTests(APITestCase):
         self.assertFalse(SOPDocument.objects.filter(sop_code="SOP-903").exists())
 
 
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class SopFileAccessControlTests(APITestCase):
+    """P0 regression: uploaded SOPs are controlled documents, not public files.
+
+    Django's static() media serving has no authentication and activates whenever DEBUG is
+    true -- which the Docker stack sets -- so every uploaded procedure was downloadable by
+    anyone who knew or guessed the URL.
+    """
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.conf import settings
+
+        shutil.rmtree(settings.MEDIA_ROOT, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        self.admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.client.force_authenticate(user=self.admin)
+        upload = SimpleUploadedFile("sop.txt", SOP_TEXT.encode("utf-8"), content_type="text/plain")
+        self.sop_id = self.client.post(
+            "/api/sops/documents/",
+            {
+                "title": "Cleanroom Entry", "sop_code": "SOP-930", "version": "v1.0",
+                "department": "Production", "file": upload,
+            },
+        ).data["id"]
+
+    def test_media_url_is_not_served_at_all(self):
+        """The unauthenticated route must be gone, not merely unlinked from the UI."""
+        self.client.force_authenticate(user=None)
+        response = self.client.get("/media/sops/sop.txt")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_download_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.get(f"/api/sops/documents/{self.sop_id}/download/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_authenticated_learner_can_download(self):
+        """SOP text is already readable by every authenticated role via /api/sops/chunks/,
+        so gating the source file more tightly than its own extracted content would be
+        theatre. The control being restored here is authentication, not role separation."""
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get(f"/api/sops/documents/{self.sop_id}/download/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(b"gowning", b"".join(response.streaming_content).lower())
+
+    def test_download_of_unknown_sop_is_404(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/sops/documents/999999/download/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_list_payload_exposes_a_download_url_not_a_raw_media_path(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/sops/documents/")
+        row = next(item for item in response.data if item["id"] == self.sop_id)
+        self.assertIn(f"/api/sops/documents/{self.sop_id}/download/", row["download_url"])
+        self.assertNotIn("file", row)
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class SopMutationAuditTests(APITestCase):
+    """P0 regression: destroying an SOP cascades away its questions, attempts, answers and
+    mastery rows. That previously left no audit entry whatsoever."""
+
+    @classmethod
+    def tearDownClass(cls):
+        from django.conf import settings
+
+        shutil.rmtree(settings.MEDIA_ROOT, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        self.admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
+        self.client.force_authenticate(user=self.admin)
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-931", version="v1.0", department="Production",
+            file="sops/sop-931.txt", status="processed",
+        )
+        self.chunk = SOPChunk.objects.create(sop=self.sop, section_title="S1", chunk_text="text")
+
+    def test_deleting_an_sop_writes_an_audit_entry_with_the_cascade_impact(self):
+        from accounts.models import JobRole
+        from audit.models import AuditLog
+        from quiz.models import Question
+
+        role = JobRole.objects.create(name="Production Operator", department="Production")
+        Question.objects.create(
+            sop=self.sop, job_role=role, source_chunk=self.chunk,
+            question_text="Q?", explanation="Because.", status="draft",
+        )
+
+        response = self.client.delete(f"/api/sops/documents/{self.sop.id}/")
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+        entry = AuditLog.objects.get(action="sop_deleted")
+        self.assertEqual(entry.user, self.admin)
+        self.assertEqual(entry.details["sop_code"], "SOP-931")
+        self.assertEqual(entry.details["questions_deleted"], 1)
+        self.assertEqual(entry.details["chunks_deleted"], 1)
+
+    def test_updating_sop_metadata_writes_an_audit_entry(self):
+        from audit.models import AuditLog
+
+        self.client.patch(
+            f"/api/sops/documents/{self.sop.id}/", {"title": "Renamed Procedure"}, format="json"
+        )
+        entry = AuditLog.objects.get(action="sop_updated")
+        self.assertIn("title", entry.details["fields_changed"])
+        self.assertEqual(entry.details["previous"]["title"], "Cleanroom Entry")
+
+    def test_reprocessing_is_blocked_once_approved_questions_exist(self):
+        """Reprocessing rebuilds chunks, which cascades away ChunkMastery and orphans
+        approved questions from their source text. Blocking it prevents silent destruction
+        of training history; versioned reprocessing is the deferred proper fix."""
+        from accounts.models import JobRole
+        from quiz.models import Question
+
+        role = JobRole.objects.create(name="Production Operator", department="Production")
+        Question.objects.create(
+            sop=self.sop, job_role=role, source_chunk=self.chunk,
+            question_text="Q?", explanation="Because.", status="approved",
+        )
+
+        response = self.client.post(f"/api/sops/documents/{self.sop.id}/process/")
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        # The chunk (and therefore any ChunkMastery hanging off it) survived.
+        self.assertTrue(SOPChunk.objects.filter(id=self.chunk.id).exists())
+
+    def test_reprocessing_still_allowed_when_only_drafts_exist(self):
+        """Regenerating before review is the normal workflow and must keep working."""
+        from accounts.models import JobRole
+        from quiz.models import Question
+
+        role = JobRole.objects.create(name="Production Operator", department="Production")
+        Question.objects.create(
+            sop=self.sop, job_role=role, question_text="Q?", explanation="Because.", status="draft",
+        )
+        response = self.client.post(f"/api/sops/documents/{self.sop.id}/process/")
+        self.assertNotEqual(response.status_code, status.HTTP_409_CONFLICT)
+
+
 class ChunkTextTests(SimpleTestCase):
     def test_splits_on_detected_section_headings(self):
         chunks = chunk_text(SOP_TEXT)

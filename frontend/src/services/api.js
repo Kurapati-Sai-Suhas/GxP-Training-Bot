@@ -117,6 +117,12 @@ export async function getSectionMasteryStatus() {
   return request("/attempts/section-mastery/");
 }
 
+// The learner's own adaptive state, section by section, with the reasoning attached --
+// this is what lets the UI answer "why am I being given this training?".
+export async function getLearningPath() {
+  return request("/attempts/learning-path/");
+}
+
 export async function getSopDocuments() {
   return request("/sops/documents/");
 }
@@ -163,6 +169,19 @@ export async function downloadAuditLogCsv() {
 
 export async function createSopDocument(formData) {
   return postForm("/sops/documents/", formData);
+}
+
+// Uploaded SOPs are no longer served from an unauthenticated /media/ route, so the file
+// has to be fetched with the auth header and handed to the browser as a blob -- a plain
+// <a href> or window.open cannot carry the token.
+export async function fetchSopFileBlob(id) {
+  const response = await fetch(`${API_BASE_URL}/sops/documents/${id}/download/`, {
+    headers: authHeaders(),
+  });
+  if (!response.ok) {
+    await parseErrorAndThrow(response, `/sops/documents/${id}/download/`);
+  }
+  return response.blob();
 }
 
 export async function processSopDocument(id) {

@@ -18,6 +18,9 @@ class SOPChunkSerializer(serializers.ModelSerializer):
 class SOPDocumentSerializer(serializers.ModelSerializer):
     chunks_count = serializers.IntegerField(source="chunks.count", read_only=True)
     status_label = serializers.CharField(source="get_status_display", read_only=True)
+    # The raw MEDIA_URL path is no longer servable (see config/urls.py); clients must go
+    # through the authenticated download action instead.
+    download_url = serializers.SerializerMethodField()
 
     class Meta:
         model = SOPDocument
@@ -28,6 +31,7 @@ class SOPDocumentSerializer(serializers.ModelSerializer):
             "version",
             "department",
             "file",
+            "download_url",
             "status",
             "status_label",
             "uploaded_by",
@@ -35,6 +39,14 @@ class SOPDocumentSerializer(serializers.ModelSerializer):
             "chunks_count",
         ]
         read_only_fields = ["created_at", "status"]
+        extra_kwargs = {"file": {"write_only": True}}
+
+    def get_download_url(self, obj):
+        if not obj.file:
+            return None
+        path = f"/api/sops/documents/{obj.id}/download/"
+        request = self.context.get("request")
+        return request.build_absolute_uri(path) if request else path
 
     def validate_file(self, value):
         # Server-side enforcement: previously only the frontend's <input accept=...>

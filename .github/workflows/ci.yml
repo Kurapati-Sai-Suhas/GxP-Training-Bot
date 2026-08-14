@@ -34,6 +34,9 @@ jobs:
         working-directory: backend
         run: pip install -r requirements.txt
 
+      # No NVIDIA_API_KEY is set anywhere in CI. The suite must never need a live provider:
+      # offline-fallback paths are exercised by an empty key, and the live path is exercised
+      # by mocking the client (ai_engine/tests.py::LiveLLMPathTests).
       - name: Run migrations and test suite (against real Postgres)
         working-directory: backend
         env:
@@ -44,6 +47,35 @@ jobs:
         run: |
           python manage.py migrate
           python manage.py test
+
+      - name: Check for missing migrations
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-test-secret-key
+          DEBUG: "False"
+          DATABASE_URL: postgres://gxp:gxp_pass@localhost:5432/gxp_training_bot
+        run: python manage.py makemigrations --check --dry-run
+
+      # Proves the settings module *can* be configured to satisfy Django's own production
+      # security checklist with zero warnings, using the same environment variables a real
+      # deployment sets. Runs at --fail-level WARNING so a regression here breaks the build.
+      - name: Django deployment security check
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-deploy-check-only-nJ8pQ2vX7mR4tL9wZ3cF6yB1hK5sD0gA
+          DEBUG: "False"
+          ALLOWED_HOSTS: example.com
+          SECURE_HSTS_SECONDS: "31536000"
+          SECURE_HSTS_INCLUDE_SUBDOMAINS: "True"
+          SECURE_HSTS_PRELOAD: "True"
+          DATABASE_URL: postgres://gxp:gxp_pass@localhost:5432/gxp_training_bot
+        run: python manage.py check --deploy --fail-level WARNING
+
+      - name: Dependency vulnerability scan
+        working-directory: backend
+        run: |
+          pip install pip-audit
+          pip-audit --requirement requirements.txt --strict
 
   frontend:
     runs-on: ubuntu-latest
@@ -62,6 +94,14 @@ jobs:
         working-directory: frontend
         run: npm install
 
+      - name: Lint
+        working-directory: frontend
+        run: npx eslint src --max-warnings 5
+
       - name: Build
         working-directory: frontend
         run: npm run build
+
+      - name: Dependency vulnerability scan
+        working-directory: frontend
+        run: npm audit --audit-level=high

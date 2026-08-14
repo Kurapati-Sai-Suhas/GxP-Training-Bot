@@ -49,6 +49,74 @@ class DashboardSummaryTests(APITestCase):
         self.assertAlmostEqual(top["correct_rate"], 25.0, places=1)
 
 
+class DashboardAccessControlTests(APITestCase):
+    """P0 regression: dashboard-summary declared no permission class, so it fell through to
+    the global IsAuthenticated default and returned every learner's name, role, SOP, score
+    and pass/fail status to any authenticated caller -- including their peers."""
+
+    def setUp(self):
+        from django.contrib.auth.models import Group
+
+        from accounts.permissions import SME_GROUP
+
+        self.learner = get_user_model().objects.create_user(
+            username="rohit", password="demo12345", first_name="Rohit", last_name="Mehta"
+        )
+        self.other = get_user_model().objects.create_user(
+            username="priya", password="demo12345", first_name="Priya", last_name="Nair"
+        )
+        self.reviewer = get_user_model().objects.create_user(username="vikram", password="demo12345")
+        self.reviewer.groups.add(Group.objects.get_or_create(name=SME_GROUP)[0])
+        self.admin = get_user_model().objects.create_user(username="anjali", password="demo12345", is_staff=True)
+
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-940", version="v1.0", department="Production",
+            file="sops/sop-940.txt", status="processed",
+        )
+        for user in (self.learner, self.other):
+            QuizAttempt.objects.create(
+                learner=user, job_role=self.role, sop=self.sop, score=91, completed_at=timezone.now(),
+            )
+
+    def _learner_names(self, response):
+        return {row["learner"] for row in response.data["learner_progress"]}
+
+    def test_requires_authentication(self):
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertEqual(response.status_code, 401)
+
+    def test_learner_sees_only_their_own_progress_row(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._learner_names(response), {"Rohit Mehta"})
+
+    def test_learner_cannot_see_another_learners_name_or_score(self):
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertNotIn("Priya Nair", response.content.decode("utf-8"))
+
+    def test_reviewer_sees_every_learner(self):
+        self.client.force_authenticate(user=self.reviewer)
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertEqual(self._learner_names(response), {"Rohit Mehta", "Priya Nair"})
+
+    def test_admin_sees_every_learner(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertEqual(self._learner_names(response), {"Rohit Mehta", "Priya Nair"})
+
+    def test_non_identifying_aggregates_remain_visible_to_learners(self):
+        """Scoping must not gut the dashboard: counts and role averages carry no identity
+        and are what make it useful to a learner at all."""
+        self.client.force_authenticate(user=self.learner)
+        response = self.client.get("/api/analytics/dashboard-summary/")
+        self.assertEqual(response.data["attempts"], 2)
+        self.assertIn("average_score", response.data)
+        self.assertIn("attempts_by_role", response.data)
+
+
 class RecommendedRefresherTests(APITestCase):
     def setUp(self):
         self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import re
@@ -6,12 +7,46 @@ import time
 
 from openai import OpenAI
 
+logger = logging.getLogger(__name__)
+
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NVIDIA_NIM_MODEL = "meta/llama-3.1-8b-instruct"
 NVIDIA_NIM_MAX_ATTEMPTS = 3
 NVIDIA_NIM_RETRY_BACKOFF_SECONDS = 0.5
 
 REQUIRED_KEYS = {"question_text", "options", "correct_option_index", "explanation"}
+
+
+def classify_llm_error(exc):
+    """Bucket a provider exception into an operator-actionable category.
+
+    The fallback contract deliberately swallows every failure so the pipeline degrades
+    instead of breaking -- which previously made an expired API key, a quota exhaustion and
+    a transient network blip completely indistinguishable in production. The categories
+    below are what an operator actually needs to tell apart, derived from the exception
+    type name and message because the OpenAI SDK's typed exceptions are not all importable
+    across the version range this project pins.
+    """
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+
+    if "notfound" in name or "model_not_found" in message:
+        return "model_not_found"
+    if "authentication" in name or "permissiondenied" in name or "401" in message or "403" in message:
+        return "authentication_failure"
+    if "ratelimit" in name or "429" in message or "rate limit" in message or "quota" in message:
+        return "rate_limit"
+    if "timeout" in name or "timed out" in message:
+        return "timeout"
+    if "connection" in name or "apiconnection" in name:
+        return "connection_error"
+    if isinstance(exc, json.JSONDecodeError) or "json" in message:
+        return "invalid_model_output"
+    if isinstance(exc, ValueError):
+        return "validation_failure"
+    if "internalserver" in name or "500" in message or "502" in message or "503" in message:
+        return "provider_error"
+    return "unknown"
 
 DISTRACTOR_TEMPLATES = [
     "This step is optional and may be skipped without documentation.",
@@ -110,6 +145,12 @@ def generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions
             return drafts[:number_of_questions]
         except Exception as exc:  # noqa: BLE001 - deliberately broad, see fallback contract below
             last_error = exc
+            logger.warning(
+                "NVIDIA NIM quiz generation attempt %s/%s failed (%s): %s",
+                attempt, NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc), exc,
+                extra={"provider": "nvidia_nim", "model": NVIDIA_NIM_MODEL,
+                       "error_category": classify_llm_error(exc), "attempt": attempt},
+            )
             if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
                 time.sleep(NVIDIA_NIM_RETRY_BACKOFF_SECONDS * attempt)
     raise last_error
@@ -176,7 +217,14 @@ def generate_questions(role_name, sop_chunk, number_of_questions=1):
     try:
         drafts = generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions)
         return drafts, "nvidia_nim"
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - the fallback contract: degrade, never fail
+        logger.error(
+            "NVIDIA NIM unavailable after %s attempts (%s); falling back to the offline "
+            "generator. Questions from this run are marked generation_source='mock'.",
+            NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc),
+            extra={"provider": "nvidia_nim", "error_category": classify_llm_error(exc),
+                   "fallback_used": True},
+        )
         return generate_mock_questions(role_name, sop_chunk, number_of_questions), "mock"
 
 
@@ -259,6 +307,12 @@ def answer_sop_question_with_nvidia_nim(sop_title, question, chunks):
             return answer, sections_used
         except Exception as exc:  # noqa: BLE001 - same fallback contract as generate_questions_with_nvidia_nim
             last_error = exc
+            logger.warning(
+                "NVIDIA NIM SOP chat attempt %s/%s failed (%s): %s",
+                attempt, NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc), exc,
+                extra={"provider": "nvidia_nim", "model": NVIDIA_NIM_MODEL,
+                       "error_category": classify_llm_error(exc), "attempt": attempt},
+            )
             if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
                 time.sleep(NVIDIA_NIM_RETRY_BACKOFF_SECONDS * attempt)
     raise last_error
@@ -286,6 +340,13 @@ def answer_sop_question(sop_title, question, chunks):
     try:
         answer, sections_used = answer_sop_question_with_nvidia_nim(sop_title, question, chunks)
         return answer, sections_used, "nvidia_nim"
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - the fallback contract: degrade, never fail
+        logger.error(
+            "NVIDIA NIM unavailable for SOP chat after %s attempts (%s); answering from the "
+            "best-matching chunk instead.",
+            NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc),
+            extra={"provider": "nvidia_nim", "error_category": classify_llm_error(exc),
+                   "fallback_used": True},
+        )
         answer, sections_used = answer_sop_question_offline(question, chunks)
         return answer, sections_used, "mock"

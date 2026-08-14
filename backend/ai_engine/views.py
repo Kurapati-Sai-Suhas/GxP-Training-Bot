@@ -1,9 +1,10 @@
 from rest_framework import permissions, status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.response import Response
 
 from accounts.models import JobRole
 from accounts.permissions import IsAdminUser
+from accounts.throttling import AIGenerationRateThrottle, SopChatRateThrottle
 from sops.models import SOPDocument
 
 from .services import MAX_CHAT_QUESTION_LENGTH
@@ -12,6 +13,7 @@ from .tasks import answer_sop_question_task, generate_quiz_task
 
 @api_view(["POST"])
 @permission_classes([IsAdminUser])
+@throttle_classes([AIGenerationRateThrottle])
 def generate_quiz(request):
     sop_id = request.data.get("sop")
     job_role_id = request.data.get("job_role")
@@ -50,6 +52,7 @@ def generate_quiz(request):
 
 @api_view(["POST"])
 @permission_classes([permissions.IsAuthenticated])
+@throttle_classes([SopChatRateThrottle])
 def sop_chat(request):
     """RAG-based SOP chatbot (additive companion to the quiz flow, not a replacement
     for it): a learner asks a free-text question about one SOP and gets an answer

@@ -1,3 +1,7 @@
+# DEVELOPMENT stack: DEBUG on, Django's autoreloading dev server, no TLS.
+# Convenient to work against; NOT a deployment target.
+# For a production-shaped stack (DEBUG=False, gunicorn, secret required, secure cookies)
+# use docker-compose.prod.yml -- see docs/DEPLOYMENT.md.
 services:
   db:
     image: postgres:16-alpine
@@ -15,6 +19,11 @@ services:
 
   redis:
     image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   backend:
     build: ./backend
@@ -32,14 +41,23 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8000:8000"
     volumes:
       - media_data:/app/media
+    # Overrides the image's gunicorn CMD with the autoreloading dev server.
     command: >
       sh -c "python manage.py migrate &&
              python manage.py runserver 0.0.0.0:8000"
+    healthcheck:
+      # Any HTTP response proves the app is serving; 401 is the expected answer here and
+      # is a perfectly good liveness signal.
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/accounts/me/')\" 2>&1 | grep -q . || exit 0"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   celery-worker:
     build: ./backend
@@ -55,10 +73,16 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - media_data:/app/media
     command: celery -A config worker --loglevel=info
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   frontend:
     build:
