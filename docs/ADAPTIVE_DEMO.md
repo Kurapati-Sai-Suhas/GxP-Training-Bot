@@ -256,3 +256,48 @@ answer "where did this come from?" without leaving the screen.
 - Celery in non-eager mode — the demo runs tasks inline.
 - Offline fallback — this run used a live API key; without one, generation falls back to the
   deterministic offline generator and the flow is otherwise identical.
+
+
+---
+
+## Difficulty-aware adaptation — verified 19 Aug 2026
+
+The demo answers each weak section **1 of 3**, getting the **hardest** question right in one and
+the **easiest** in the other. Identical lifetime accuracy, deliberately different evidence.
+
+This arrangement exists because difficulty weighting is invisible under uniform correctness: at
+0% or 100% a weighted average equals an unweighted one regardless of the weights. Question
+difficulty itself was never uniform — ratings are seeded 1300/1500/1700 from the difficulty label
+(`quiz/models.py`).
+
+Measured output:
+
+```
+>> Section 3: Documentation Practices
+     priority : HIGH
+     measured : adaptive score 43.5% | lifetime 33.3% | 1/3 correct
+     answers  : medium(1500, w=1.50) X | hard(1700, w=2.00) OK | easy(1300, w=1.00) X
+     evidence : 43.5% recency- and difficulty-weighted accuracy
+                (1/3 correct overall = 33.3% lifetime) - below the 60% weakness threshold.
+
+>> Section 2: CAPA and Root Cause Analysis
+     priority : HIGH
+     measured : adaptive score 26.2% | lifetime 33.3% | 1/3 correct
+     answers  : easy(1300, w=1.00) OK | medium(1500, w=1.50) X | hard(1700, w=2.00) X
+
+Difficulty-aware evidence (same lifetime accuracy, different weighting):
+  Section 3: Documentation Practices      lifetime 33.3%  ->  adaptive 43.5%  [HIGH]
+  Section 2: CAPA and Root Cause Analysis lifetime 33.3%  ->  adaptive 26.2%  [HIGH]
+```
+
+**What this demonstrates.** Same score, same number of answers, different verdict strength —
+because succeeding on a harder question is stronger evidence than succeeding on an easy one. Both
+sections remain HIGH; the priority comes from the existing thresholds, not from the fixture.
+
+**What it is not.** Synthetic demonstration data. Every attempt produced by `demo_adaptive` is
+marked `is_synthetic=True` and excluded from the evaluation harness. It exercises the algorithm;
+it is not evidence about learning.
+
+**Counts vary between runs.** The number of approved questions depends on what the LLM generates
+and what deduplication removes — a run may yield 8 rather than 9. The *behaviour* (weak sections
+selected, strong excluded, difficulty changing the weighting) is stable; the exact counts are not.
