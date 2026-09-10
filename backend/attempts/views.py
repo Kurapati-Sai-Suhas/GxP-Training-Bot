@@ -10,7 +10,7 @@ from quiz.models import Question
 from sops.models import SOPDocument
 
 from . import adaptive
-from .models import AttemptAnswer, ChunkMastery, QuizAttempt, TopicMastery
+from .models import AttemptAnswer, ChunkMastery, QuizAttempt, QuizAttemptQuestion, TopicMastery
 from .serializers import AttemptAnswerSerializer, QuizAttemptSerializer
 from .services import apply_elo_update, apply_elo_update_ability_only
 
@@ -43,6 +43,49 @@ ELO_WEIGHT_CEILING = Question.DIFFICULTY_SEED_ELO["hard"]
 # still the best signal we have that a question might be ambiguous -- a wrong answer on a
 # low-confidence AI-drafted question shouldn't unfairly reset a learner's whole schedule.
 CONFIDENCE_TRUST_THRESHOLD = 0.5
+
+
+def _persist_offered_questions(attempt, question_ids):
+    """Record, once, exactly which questions this attempt offered.
+
+    Idempotent and non-destructive: if an offered set already exists it is left alone.
+    That matters because GET /api/attempts/auto-assigned/ reuses an existing incomplete
+    attempt rather than creating a new one on every page load -- re-scoping an attempt the
+    learner may already be part-way through would silently change the assessment under
+    them, and would defeat the point of recording it in the first place. The stored set is
+    authoritative from creation onwards.
+    """
+    if attempt.offered_questions.exists():
+        return list(attempt.offered_questions.values_list("question_id", flat=True))
+    QuizAttemptQuestion.objects.bulk_create(
+        [
+            QuizAttemptQuestion(attempt=attempt, question_id=question_id, position=position)
+            for position, question_id in enumerate(question_ids)
+        ]
+    )
+    return list(question_ids)
+
+
+def _validate_latency(raw):
+    """Validate client-reported response latency. Returns (value_or_None, error_or_None).
+
+    This is observational telemetry, not trusted evidence: it never affects grading,
+    mastery, scheduling or the audit trail. It is validated only so that obviously
+    impossible values never enter the dataset a future knowledge-tracing model would
+    train on.
+    """
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None, "response_latency_ms must be a number."
+    if raw < 0:
+        return None, "response_latency_ms cannot be negative."
+    if raw > AttemptAnswer.MAX_RESPONSE_LATENCY_MS:
+        return None, (
+            f"response_latency_ms exceeds the maximum plausible value "
+            f"({AttemptAnswer.MAX_RESPONSE_LATENCY_MS} ms)."
+        )
+    return int(raw), None
 
 
 def _elo_weight(question):
@@ -107,7 +150,18 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
         return queryset.filter(learner=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(learner=self.request.user)
+        attempt = serializer.save(learner=self.request.user)
+        # Record the offered set server-side at creation. For a self-started quiz the
+        # offered set is every approved question for this SOP and job role -- the same set
+        # the client previously assembled for itself from
+        # GET /api/quiz/questions/?job_role=..&status=approved. Computing it here makes the
+        # server, not the browser, the authority on what the assessment consisted of.
+        question_ids = list(
+            Question.objects.filter(sop=attempt.sop, job_role=attempt.job_role, status="approved")
+            .order_by("id")
+            .values_list("id", flat=True)
+        )
+        _persist_offered_questions(attempt, question_ids)
 
     @decorators.action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
@@ -155,23 +209,63 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        allowed_ids = set(
-            Question.objects.filter(
-                id__in=submitted_ids, sop=attempt.sop, job_role=attempt.job_role, status="approved"
-            ).values_list("id", flat=True)
-        )
-        invalid = [qid for qid in submitted_ids if qid not in allowed_ids]
-        if invalid:
+        # The submission must match the persisted offered set exactly -- same members, same
+        # count. Membership alone is not enough: it would still allow a modified client to
+        # omit questions it did not want to answer, and because the score is computed over
+        # the assessment, omission inflated it.
+        offered_ids = list(attempt.offered_questions.values_list("question_id", flat=True))
+        if not offered_ids:
+            # No recorded offered set. Attempts created before this field existed are
+            # backfilled by migration; reaching here means the attempt was created without
+            # one, which is a server-side defect rather than a client error.
+            log_action(
+                request.user, "quiz_attempt_submit_blocked", attempt,
+                summary=(
+                    f"Attempt #{attempt.id} has no recorded offered question set; "
+                    f"submission rejected"
+                ),
+                details={"submitted_count": len(submitted_ids)},
+            )
+            return response.Response(
+                {"error": "This attempt has no recorded question set and cannot be submitted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        offered = set(offered_ids)
+        submitted = set(submitted_ids)
+        if submitted != offered:
+            not_offered = sorted(submitted - offered)
+            missing = sorted(offered - submitted)
             return response.Response(
                 {
                     "error": (
-                        "This submission contains questions that do not belong to this quiz, "
-                        "or that are not approved."
+                        "This submission does not match the questions offered for this attempt. "
+                        "Every offered question must be submitted exactly once; unanswered "
+                        "questions must be sent with a null selected_option."
                     ),
-                    "invalid_question_ids": sorted(set(invalid)),
+                    # Retained under its original name so the existing contract for
+                    # "questions that do not belong to this attempt" is unchanged; the
+                    # missing/count fields are additive detail for the stricter check.
+                    "invalid_question_ids": not_offered,
+                    "not_offered_question_ids": not_offered,
+                    "missing_question_ids": missing,
+                    "offered_count": len(offered),
+                    "submitted_count": len(submitted_ids),
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Validate telemetry before any write, so a malformed value cannot half-populate a
+        # submission.
+        latencies = {}
+        for item in submitted_answers:
+            value, error = _validate_latency(item.get("response_latency_ms"))
+            if error:
+                return response.Response(
+                    {"error": error, "question": item.get("question")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            latencies[item.get("question")] = value
 
         with transaction.atomic():
             # A completed attempt is a training record: it must not be rewritten. Claiming
@@ -207,15 +301,34 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_409_CONFLICT,
                 )
             attempt.completed_at = submitted_at
-            return self._grade_and_record(request, attempt, submitted_answers)
+            return self._grade_and_record(request, attempt, submitted_answers, latencies, len(offered))
 
-    def _grade_and_record(self, request, attempt, submitted_answers):
+    def _grade_and_record(self, request, attempt, submitted_answers, latencies=None, offered_count=None):
         """Grade the submission and update every derived record. Runs inside the caller's
         transaction, so a failure part-way rolls back the completed_at claim too rather
         than stranding the attempt as completed-but-ungraded."""
         AttemptAnswer.objects.filter(attempt=attempt).delete()
+        latencies = latencies or {}
         correct_count = 0
         answered_questions = []  # (question, is_correct), for the Elo update below
+        # One server clock reading for the whole submission. The API grades a completed
+        # attempt in a single request, so all answers in it genuinely share a recording
+        # time; taking one reading keeps their relative order stable rather than letting
+        # microsecond drift imply a response sequence the server did not observe.
+        recorded_at = timezone.now()
+
+        # Learner ability as it stands BEFORE any answer in this submission moves it. Read
+        # without creating the row: on a first-ever attempt there is no TopicMastery yet,
+        # and the learner's ability at that moment genuinely is the starting rating. The
+        # row is created further down, after grading, exactly as before.
+        prior_mastery = TopicMastery.objects.filter(
+            learner=attempt.learner, sop=attempt.sop
+        ).first()
+        learner_ability_at_answer = (
+            prior_mastery.elo_rating if prior_mastery is not None
+            else TopicMastery._meta.get_field("elo_rating").default
+        )
+
         for item in submitted_answers:
             question_id = item.get("question")
             selected_option_id = item.get("selected_option")
@@ -225,17 +338,29 @@ class QuizAttemptViewSet(viewsets.ModelViewSet):
 
                 is_correct = Option.objects.filter(id=selected_option_id, question_id=question_id, is_correct=True).exists()
             correct_count += 1 if is_correct else 0
+            # Fetched before the answer row is written so the difficulty recorded is the
+            # pre-answer one. Elo is not touched until later in this method, so this read
+            # is the same value apply_elo_update() will consume.
+            question = Question.objects.filter(id=question_id).first()
             AttemptAnswer.objects.create(
                 attempt=attempt,
                 question_id=question_id,
                 selected_option_id=selected_option_id,
                 is_correct=is_correct,
+                # Server-authoritative: any answered_at supplied by the client is ignored.
+                answered_at=recorded_at,
+                response_latency_ms=latencies.get(question_id),
+                # Likewise server-authoritative -- the payload is never consulted for these.
+                question_difficulty_at_answer=(question.elo_rating if question is not None else None),
+                learner_ability_at_answer=learner_ability_at_answer,
             )
-            question = Question.objects.filter(id=question_id).first()
             if question is not None:
                 answered_questions.append((question, is_correct))
 
-        total = len(submitted_answers) or 1
+        # Score against the whole assessment that was offered, not merely the answers that
+        # came back. Under the exact-set contract these are equal, so this is defence in
+        # depth: an unanswered offered question counts as incorrect, never as absent.
+        total = offered_count or len(submitted_answers) or 1
         attempt.score = round((correct_count / total) * 100, 2)
         # completed_at was already set by the atomic claim in submit(); only the score
         # needs writing here.
@@ -416,6 +541,13 @@ def auto_assigned_retraining(request):
                     ),
                     details={"failed_attempts": failed_attempts, "sop_code": mastery.sop.sop_code},
                 )
+
+        # Record the adaptive selection as this attempt's offered set. If the attempt was
+        # reused rather than created above, the set it was created with wins -- the helper
+        # is non-destructive -- so an attempt cannot be silently re-scoped between page
+        # loads. The ids reported back to the client are therefore always the ids the
+        # server will accept at submission.
+        weak_question_ids = _persist_offered_questions(attempt, weak_question_ids)
 
         targeted_sections = adaptive.training_sections(
             sections, topic_mastered=topic_mastered, only_available=True

@@ -332,3 +332,79 @@ class ChunkTextTests(SimpleTestCase):
         text = "3.1 Cleaning Verification\nWipe the surface and inspect under UV light for residue."
         chunks = chunk_text(text)
         self.assertEqual(chunks[0][0], "3.1 Cleaning Verification")
+
+
+SOP_WITH_PREAMBLE = """Standard Operating Procedure: Cleanroom Entry and Gowning
+Section 1: Purpose
+This SOP defines the mandatory gowning sequence for personnel.
+Section 2: Gowning Sequence
+Personnel must don garments in the following strict order.
+"""
+
+SOP_STARTING_AT_A_HEADING = """Section 1: Purpose
+First body line.
+Section 2: Scope
+Second body line.
+"""
+
+SOP_WITHOUT_HEADINGS = """A line of policy text.
+Another line of policy text.
+"""
+
+
+class PreambleMergeChunkingTests(SimpleTestCase):
+    """A heading-less preamble is folded into the first real section (P2-001).
+
+    Real SOPs open with a document title, which does not match HEADING_PATTERN and so became a
+    standalone chunk. Because a learner's question naturally repeats the document's own title
+    words, that chunk outranked genuine content on lexical overlap.
+
+    Measured on the retrieval gold set: Hit@1 rose 0.786 -> 0.857 and MRR 0.893 -> 0.929, and
+    every title-only chunk disappeared (3 -> 0). Discarding the preamble scored identically but
+    destroys text, so merging was chosen instead.
+    """
+
+    def test_preamble_does_not_become_its_own_chunk(self):
+        chunks = chunk_text(SOP_WITH_PREAMBLE)
+        self.assertTrue(all(title is not None for title, _b, _s in chunks),
+                        "no untitled chunk should survive when headings exist")
+        self.assertEqual([t for t, _b, _s in chunks],
+                         ["Section 1: Purpose", "Section 2: Gowning Sequence"])
+
+    def test_preamble_text_is_preserved_not_discarded(self):
+        chunks = chunk_text(SOP_WITH_PREAMBLE)
+        first_body = chunks[0][1]
+        self.assertIn("Standard Operating Procedure: Cleanroom Entry and Gowning", first_body)
+        self.assertIn("mandatory gowning sequence", first_body)
+
+    def test_section_content_is_not_cross_contaminated(self):
+        """The merge must touch only the first section."""
+        bodies = {t: b for t, b, _s in chunk_text(SOP_WITH_PREAMBLE)}
+        self.assertNotIn("Standard Operating Procedure", bodies["Section 2: Gowning Sequence"])
+
+    def test_document_with_no_headings_is_unaffected(self):
+        """A document with no headings must still reach the semantic/fixed-length fallback."""
+        chunks = chunk_text(SOP_WITHOUT_HEADINGS)
+        self.assertTrue(chunks)
+        self.assertTrue(all(title is None for title, _b, _s in chunks))
+        self.assertIn(chunks[0][2], {"semantic", "fixed_length"})
+
+    def test_document_starting_with_a_heading_is_unchanged(self):
+        """No preamble means nothing to merge."""
+        chunks = chunk_text(SOP_STARTING_AT_A_HEADING)
+        self.assertEqual([t for t, _b, _s in chunks],
+                         ["Section 1: Purpose", "Section 2: Scope"])
+        self.assertNotIn("Section 1: Purpose", chunks[0][1])
+
+    def test_chunking_is_deterministic(self):
+        self.assertEqual(chunk_text(SOP_WITH_PREAMBLE), chunk_text(SOP_WITH_PREAMBLE))
+
+    def test_provenance_titles_are_stable_for_the_gold_set(self):
+        """The retrieval gold set keys on section titles, so chunking must not rename them."""
+        titles = [t for t, _b, _s in chunk_text(SOP_WITH_PREAMBLE)]
+        self.assertIn("Section 1: Purpose", titles)
+        self.assertIn("Section 2: Gowning Sequence", titles)
+
+    def test_heading_strategy_is_still_recorded(self):
+        for _t, _b, strategy in chunk_text(SOP_WITH_PREAMBLE):
+            self.assertEqual(strategy, "heading")

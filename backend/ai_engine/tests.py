@@ -1,4 +1,5 @@
 import json
+import os
 from unittest import mock
 
 from django.contrib.auth import get_user_model
@@ -11,7 +12,7 @@ from audit.models import AuditLog
 from quiz.models import Question
 from sops.models import SOPChunk, SOPDocument
 
-from . import services, tasks
+from . import retrieval_evaluation, services, tasks
 from .services import select_relevant_chunks
 
 
@@ -294,6 +295,69 @@ class LLMErrorClassificationTests(SimpleTestCase):
     def test_unrecognised_error_is_not_misreported(self):
         self.assertEqual(services.classify_llm_error(Exception("something odd")), "unknown")
 
+    def test_classifies_retired_model_from_410(self):
+        """A retired model is permanent; a transient blip is not. Conflating them is how
+        both of this project's models stayed dead for two weeks unnoticed.
+
+        NVIDIA returns HTTP 410 Gone with an 'end of life' detail. That previously fell
+        through every branch to 'unknown', so the log line was indistinguishable from a
+        network hiccup and no operator had reason to act."""
+        real_message = (
+            "Error code: 410 - {'type': 'about:blank', 'title': 'Gone', 'status': 410, "
+            "'detail': \"The model 'meta/llama-3.1-8b-instruct' has reached its end of "
+            "life on 2026-08-26T09:00:00Z and is no longer available.\"}"
+        )
+        self.assertEqual(services.classify_llm_error(Exception(real_message)), "model_retired")
+
+    def test_retired_is_distinct_from_model_not_found(self):
+        """404 means 'not entitled / wrong id' -- a config error that may be fixable in
+        place. 410 means 'this will never work again'. Different remedies, different
+        categories, so an alert can route them differently."""
+        self.assertEqual(
+            services.classify_llm_error(Exception("Error code: 404 - Not found for account")),
+            "model_not_found",
+        )
+        self.assertEqual(
+            services.classify_llm_error(Exception("model has reached its end of life")),
+            "model_retired",
+        )
+
+
+class ModelConfigurationTests(SimpleTestCase):
+    """Model ids must be configuration, not code.
+
+    Both models were hardcoded constants. When NVIDIA retired them, recovery required a
+    code edit, review, rebuild and redeploy -- for what is a one-line config change.
+    Resolution happens at CALL time so a running worker picks up a new value."""
+
+    def test_chat_model_defaults_when_unset(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("NVIDIA_NIM_MODEL", None)
+            self.assertEqual(services.nim_model(), services.DEFAULT_NVIDIA_NIM_MODEL)
+
+    def test_chat_model_is_overridable_without_a_code_change(self):
+        with mock.patch.dict("os.environ", {"NVIDIA_NIM_MODEL": "vendor/replacement-v2"}):
+            self.assertEqual(services.nim_model(), "vendor/replacement-v2")
+
+    def test_embedding_model_is_overridable_without_a_code_change(self):
+        from sops import services as sop_services
+
+        with mock.patch.dict("os.environ", {"NVIDIA_EMBED_MODEL": "vendor/embed-v9"}):
+            self.assertEqual(sop_services.embed_model(), "vendor/embed-v9")
+
+    def test_default_chat_model_is_not_a_retired_model(self):
+        """Guards the specific regression that caused this work: shipping a default that
+        the provider has already retired."""
+        retired = {"meta/llama-3.1-8b-instruct", "nvidia/nv-embedqa-e5-v5"}
+        self.assertNotIn(services.DEFAULT_NVIDIA_NIM_MODEL, retired)
+
+    def test_resolution_is_at_call_time_not_import_time(self):
+        """Import-time resolution would mean a worker had to restart to pick up a rotation."""
+        with mock.patch.dict("os.environ", {"NVIDIA_NIM_MODEL": "first/model"}):
+            self.assertEqual(services.nim_model(), "first/model")
+        with mock.patch.dict("os.environ", {"NVIDIA_NIM_MODEL": "second/model"}):
+            self.assertEqual(services.nim_model(), "second/model")
+
 
 @mock.patch("ai_engine.services.time.sleep", lambda *_: None)  # keep the backoff instant
 @mock.patch.dict("os.environ", {"NVIDIA_API_KEY": "test-key-not-a-real-credential"})
@@ -421,6 +485,45 @@ class SelectRelevantChunksTests(SimpleTestCase):
         selected = select_relevant_chunks("completely unrelated query xyz", chunks, max_chunks=2)
         self.assertEqual([c.section_title for c in selected], ["Section 1", "Section 2"])
 
+    def test_production_default_ranker_is_the_measured_winner(self):
+        """BM25 was implemented and evaluated against this gold set, and LOST on every
+        configuration tested (MRR 0.9048-0.9167 vs overlap's 0.9286). This pins the decision
+        so a later 'BM25 is standard practice' edit cannot silently regress retrieval."""
+        self.assertEqual(services.DEFAULT_RANKER, "overlap")
+
+    def test_both_rankers_remain_callable_for_re_evaluation(self):
+        """The rejected ranker is kept so the comparison can be re-run when the corpus grows
+        past the scale at which IDF becomes a meaningful statistic."""
+        chunks = [
+            FakeChunk("Gowning", "Personnel must don hair cover, face mask and sterile gloves last."),
+            FakeChunk("HPLC", "The HPLC system must be calibrated annually per the manual."),
+        ]
+        for ranker in ("overlap", "bm25"):
+            with self.subTest(ranker=ranker):
+                selected = select_relevant_chunks("donning sterile gloves order", chunks,
+                                                  max_chunks=2, ranker=ranker)
+                self.assertEqual(len(selected), 2)
+
+    def test_bm25_length_normalisation_is_active(self):
+        """Pins the MECHANISM behind the rejection, at a scale a unit test can honestly assert.
+
+        The corpus-level effect that sank BM25 (a 6-token title chunk scoring 2.885 against
+        the correct 31-token chunk's 1.472) depends on document-frequency statistics across
+        a 5-chunk corpus, and cannot be faithfully reproduced with a two-chunk fixture --
+        IDF behaves quite differently at N=2. That evidence lives in the measurement script
+        (scratchpad/bm25_corrected.py) and the decision comment beside DEFAULT_RANKER.
+
+        What IS honestly assertable here is that length normalisation is switched on and
+        does what b is supposed to do: of two chunks matching the same single term, the
+        shorter scores higher. That is the property which, at corpus scale, elevated the
+        degenerate chunks."""
+        short = FakeChunk("Short", "Gowning required.")
+        long = FakeChunk("Long", "Gowning is required and " + "additional procedural text " * 12)
+        scores = services._bm25_scores("gowning", [short, long])
+        self.assertGreater(scores[0], scores[1],
+                           "b>0 must favour the shorter chunk for an equal term match")
+        self.assertGreater(services.BM25_B, 0, "length normalisation must be enabled")
+
 
 class SopChatTests(APITestCase):
     def setUp(self):
@@ -486,3 +589,204 @@ class SopChatTests(APITestCase):
         entry = AuditLog.objects.get(action="sop_chat_query")
         self.assertEqual(entry.user, self.learner)
         self.assertEqual(entry.object_id, self.sop.id)
+
+
+class RetrievalGoldSetTests(SimpleTestCase):
+    """The gold set is the measuring instrument. If it drifts, every retrieval number based on
+    it silently becomes wrong, so its shape and its honesty markers are pinned here."""
+
+    def setUp(self):
+        self.gold = retrieval_evaluation.load_gold_set()
+
+    def test_1_schema(self):
+        self.assertIn("version", self.gold)
+        self.assertIn("queries", self.gold)
+        required = {"id", "query", "sop_code", "relevant_sections", "category", "notes"}
+        for case in self.gold["queries"]:
+            with self.subTest(query=case.get("id")):
+                self.assertTrue(required.issubset(case), f"missing {required - set(case)}")
+                self.assertIsInstance(case["relevant_sections"], list)
+                self.assertTrue(case["notes"].strip(), "every label needs a stated rationale")
+
+    def test_2_loading_is_deterministic(self):
+        self.assertEqual(self.gold, retrieval_evaluation.load_gold_set())
+
+    def test_query_ids_are_unique(self):
+        ids = [c["id"] for c in self.gold["queries"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_synthetic_demo_corpus_is_excluded(self):
+        """SOP-DEMO is wiped and regenerated by demo_adaptive, so a label keyed to it would
+        break on every demo run."""
+        self.assertIn("SOP-DEMO", self.gold["corpus"]["excluded"])
+        for case in self.gold["queries"]:
+            self.assertNotEqual(case["sop_code"], "SOP-DEMO")
+
+    def test_gold_set_declares_what_it_is_not(self):
+        honesty = self.gold["honesty"]
+        self.assertIn("not production data", honesty["nature"].lower())
+        self.assertIn("not statistically representative", honesty["size"].lower())
+
+    def test_covers_the_failure_categories_it_claims_to(self):
+        categories = {c["category"] for c in self.gold["queries"]}
+        for expected in ("exact_terminology", "paraphrase", "multi_section", "irrelevant"):
+            self.assertIn(expected, categories)
+
+    def test_10_multiple_relevant_chunks_are_representable(self):
+        multi = [c for c in self.gold["queries"] if len(c["relevant_sections"]) > 1]
+        self.assertTrue(multi, "at least one query must span two sections")
+
+    def test_4_irrelevant_query_has_an_empty_relevant_set(self):
+        irrelevant = [c for c in self.gold["queries"] if c["category"] == "irrelevant"]
+        self.assertTrue(irrelevant)
+        for case in irrelevant:
+            self.assertEqual(case["relevant_sections"], [])
+
+
+class RetrievalMetricTests(SimpleTestCase):
+    """Metric arithmetic against hand-computable cases, so a wrong formula cannot hide behind a
+    plausible-looking score."""
+
+    def _result(self, expected, retrieved):
+        return retrieval_evaluation.QueryResult(
+            query_id="T", query="q", sop_code="SOP-X", category="test",
+            expected_sections=[], expected_chunk_ids=expected,
+            retrieved_chunk_ids=retrieved, retrieved_sections=[],
+            candidate_pool=len(retrieved),
+            first_relevant_rank=next(
+                (i for i, c in enumerate(retrieved, 1) if c in expected), None),
+        )
+
+    def test_5_recall_at_k(self):
+        single = self._result(expected=[2], retrieved=[1, 2, 3])
+        self.assertEqual(single.recall_at(1), 0.0)
+        self.assertEqual(single.recall_at(2), 1.0)
+        multi = self._result(expected=[2, 3], retrieved=[1, 2, 3])
+        self.assertEqual(multi.recall_at(2), 0.5)
+        self.assertEqual(multi.recall_at(3), 1.0)
+
+    def test_6_precision_at_1(self):
+        self.assertEqual(self._result([1], [1, 2, 3]).precision_at(1), 1.0)
+        self.assertEqual(self._result([2], [1, 2, 3]).precision_at(1), 0.0)
+
+    def test_7_hit_at_1(self):
+        self.assertTrue(self._result([1], [1, 2]).hit_at_1)
+        self.assertFalse(self._result([2], [1, 2]).hit_at_1)
+
+    def test_8_mrr(self):
+        self.assertEqual(self._result([1], [1, 2, 3]).reciprocal_rank, 1.0)
+        self.assertEqual(self._result([2], [1, 2, 3]).reciprocal_rank, 0.5)
+        self.assertEqual(self._result([3], [1, 2, 3]).reciprocal_rank, 1 / 3)
+        self.assertEqual(self._result([9], [1, 2, 3]).reciprocal_rank, 0.0)
+
+    def test_9_empty_retrieval(self):
+        empty = self._result(expected=[1], retrieved=[])
+        self.assertEqual(empty.recall_at(1), 0.0)
+        self.assertEqual(empty.precision_at(1), 0.0)
+        self.assertEqual(empty.reciprocal_rank, 0.0)
+
+    def test_metrics_are_undefined_not_zero_when_nothing_is_relevant(self):
+        """Recall over an empty relevant set is undefined. Averaging a 0.0 in would understate
+        every other query, so the irrelevant case is excluded from scoring instead."""
+        none_relevant = self._result(expected=[], retrieved=[1, 2])
+        self.assertIsNone(none_relevant.recall_at(1))
+        self.assertIsNone(none_relevant.precision_at(1))
+        self.assertIsNone(none_relevant.reciprocal_rank)
+
+
+class RetrievalBaselineTests(APITestCase):
+    """The evaluator run over real chunks, through the production retrieval function."""
+
+    def setUp(self):
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry and Gowning", sop_code="SOP-300", version="v1.0",
+            department="Production", file="f.txt", status="processed",
+        )
+        self.purpose = SOPChunk.objects.create(
+            sop=self.sop, section_title="Section 1: Purpose", chunking_strategy="heading",
+            chunk_text="This SOP defines the mandatory gowning sequence for personnel entering "
+                       "a Grade B cleanroom in the production area.")
+        self.sequence = SOPChunk.objects.create(
+            sop=self.sop, section_title="Section 2: Gowning Sequence", chunking_strategy="heading",
+            chunk_text="Personnel must don garments in the following strict order: hair cover, "
+                       "face mask, sterile coverall, safety goggles, and sterile gloves last.")
+        self.time_limit = SOPChunk.objects.create(
+            sop=self.sop, section_title="Section 3: Time Limit", chunking_strategy="heading",
+            chunk_text="A single gowning cycle inside the Grade B area is limited to a maximum "
+                       "of four hours.")
+
+    def _run(self, queries):
+        import tempfile
+        from pathlib import Path
+        payload = {"version": "test", "corpus": {"sop_codes": ["SOP-300"], "excluded": {}},
+                   "labelling": {}, "honesty": {}, "queries": queries}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            path = fh.name
+        return retrieval_evaluation.evaluate_retrieval(Path(path))
+
+    def test_3_known_relevant_chunk_is_retrieved_and_ranked(self):
+        report = self._run([{
+            "id": "T1", "query": "What is the maximum time inside the Grade B area?",
+            "sop_code": "SOP-300", "relevant_sections": ["Section 3: Time Limit"],
+            "category": "exact_terminology", "notes": "n",
+        }])
+        result = report.results[0]
+        self.assertIn(self.time_limit.id, result.retrieved_chunk_ids)
+        self.assertEqual(result.first_relevant_rank, 1)
+
+    def test_11_provenance_survives_evaluation(self):
+        """Every retrieved chunk must stay traceable to its document and section."""
+        report = self._run([{
+            "id": "T2", "query": "gowning order garments", "sop_code": "SOP-300",
+            "relevant_sections": ["Section 2: Gowning Sequence"],
+            "category": "exact_terminology", "notes": "n",
+        }])
+        result = report.results[0]
+        self.assertEqual(result.sop_code, "SOP-300")
+        self.assertEqual(len(result.retrieved_chunk_ids), len(result.retrieved_sections))
+        for chunk_id, title in zip(result.retrieved_chunk_ids, result.retrieved_sections):
+            chunk = SOPChunk.objects.get(id=chunk_id)
+            self.assertEqual(chunk.section_title, title)
+            self.assertEqual(chunk.sop.sop_code, "SOP-300")
+
+    def test_gold_set_keys_on_titles_so_it_survives_reseeding(self):
+        """Chunk primary keys change when data is reseeded; section titles do not."""
+        report = self._run([{
+            "id": "T3", "query": "gowning", "sop_code": "SOP-300",
+            "relevant_sections": ["Section 2: Gowning Sequence"],
+            "category": "exact_terminology", "notes": "n",
+        }])
+        self.assertEqual(report.results[0].expected_chunk_ids, [self.sequence.id])
+
+    def test_unresolvable_label_is_skipped_not_scored_zero(self):
+        report = self._run([{
+            "id": "T4", "query": "x", "sop_code": "SOP-300",
+            "relevant_sections": ["Section 9: Does Not Exist"],
+            "category": "exact_terminology", "notes": "n",
+        }])
+        self.assertEqual(report.results, [])
+        self.assertEqual(len(report.skipped), 1)
+        self.assertIn("not found", report.skipped[0]["reason"])
+
+    def test_summary_flags_that_retrieval_does_not_filter(self):
+        report = self._run([{
+            "id": "T5", "query": "gowning", "sop_code": "SOP-300",
+            "relevant_sections": ["Section 2: Gowning Sequence"],
+            "category": "exact_terminology", "notes": "n",
+        }])
+        summary = retrieval_evaluation.summarise(report)
+        self.assertFalse(summary["corpus"]["retrieval_filters"])
+        self.assertIn("DEGENERATE", summary["metric_caveats"]["recall_at_5"])
+
+    def test_12_irrelevant_query_is_excluded_from_scoring(self):
+        report = self._run([
+            {"id": "T6", "query": "annual leave policy", "sop_code": "SOP-300",
+             "relevant_sections": [], "category": "irrelevant", "notes": "n"},
+            {"id": "T7", "query": "gowning order garments", "sop_code": "SOP-300",
+             "relevant_sections": ["Section 2: Gowning Sequence"],
+             "category": "exact_terminology", "notes": "n"},
+        ])
+        self.assertEqual(len(report.results), 2)
+        self.assertEqual(len(report.scored), 1)
+        self.assertEqual(retrieval_evaluation.summarise(report)["queries_scored"], 1)

@@ -81,6 +81,51 @@ _RECENCY_DECAY = 0.5 ** (1.0 / RECENCY_HALF_LIFE)
 # the first constant that should be tuned.
 MIN_EVIDENCE = 3
 
+# --- Difficulty weighting ---------------------------------------------------------------
+# Elo already weights the *pass signal* that drives mastery and FSRS (see views.py::
+# _elo_weight), but until now it did not weight the accuracy that drives *priority*. An easy
+# question missed and a hard question missed therefore contributed identically to whether a
+# section was called weak -- a learner failing only the hard items looked the same as one
+# failing everything.
+#
+# Each answer's recency weight is now multiplied by a difficulty weight in the same 1.0-2.0
+# range the pass signal already uses, so the two halves of the system finally agree on what
+# "hard" means:
+#
+#     w_i = 0.5 ** (i / RECENCY_HALF_LIFE)  ×  difficulty_weight_i
+#
+# Because this is a weighted *average*, the effect is symmetric and self-balancing: a hard
+# question contributes more evidence either way. Missing it drags the score down further than
+# missing an easy one; answering it correctly lifts the score further than an easy success.
+#
+# Which difficulty is used matters. The obvious choice -- the question's live elo_rating -- was
+# rejected: it moves every time *any* learner answers, so a section's past accuracy would drift
+# without the learner doing anything, and a decision made today could not be reproduced
+# tomorrow. Instead each answer carries the difficulty recorded when it was given
+# (AttemptAnswer.question_difficulty_at_answer). A past decision therefore stays explainable
+# exactly as it was made.
+#
+# Answers recorded before that snapshot existed have no difficulty, and are weighted 1.0 --
+# neutral, identical to the previous behaviour. The metric degrades gracefully rather than
+# guessing, and no historical decision silently changes meaning.
+DIFFICULTY_WEIGHT_FLOOR = Question.DIFFICULTY_SEED_ELO["easy"]
+DIFFICULTY_WEIGHT_CEILING = Question.DIFFICULTY_SEED_ELO["hard"]
+NEUTRAL_DIFFICULTY_WEIGHT = 1.0
+
+
+def difficulty_weight(difficulty):
+    """Map a recorded question difficulty onto the 1.0-2.0 evidence weight.
+
+    Returns the neutral weight for an answer with no recorded difficulty, so sequences that
+    predate the snapshot behave exactly as they did before difficulty weighting existed.
+    """
+    if difficulty is None:
+        return NEUTRAL_DIFFICULTY_WEIGHT
+    span = DIFFICULTY_WEIGHT_CEILING - DIFFICULTY_WEIGHT_FLOOR
+    fraction = (difficulty - DIFFICULTY_WEIGHT_FLOOR) / span
+    fraction = max(0.0, min(1.0, fraction))  # clamp: one outlier rating must not dominate
+    return 1.0 + fraction
+
 PRIORITY_HIGH = "high"
 PRIORITY_MEDIUM = "medium"
 PRIORITY_LOW = "low"
@@ -106,18 +151,28 @@ def _answer_history_by_chunk(learner, sop, job_role):
             attempt__job_role=job_role,
         )
         .order_by("-id")  # newest first; id order matches answer order within an attempt
-        .values_list("question__source_chunk", "is_correct")
+        .values_list("question__source_chunk", "is_correct", "question_difficulty_at_answer")
     )
     history = {}
-    for chunk_id, is_correct in rows:
+    difficulties = {}
+    for chunk_id, is_correct, difficulty in rows:
         history.setdefault(chunk_id, []).append(bool(is_correct))
-    return history
+        # Parallel newest-first list. None for answers recorded before the difficulty snapshot
+        # existed; weighted_accuracy treats those as neutral rather than guessing a value.
+        difficulties.setdefault(chunk_id, []).append(difficulty)
+    return history, difficulties
 
 
-def weighted_accuracy(sequence):
-    """Exponentially recency-weighted accuracy over a newest-first answer sequence.
+def weighted_accuracy(sequence, difficulties=None):
+    """Recency- and difficulty-weighted accuracy over a newest-first answer sequence.
 
-        weighted = Σ(w_i · correct_i) / Σ(w_i),   w_i = 0.5 ** (i / RECENCY_HALF_LIFE)
+        weighted = Σ(w_i · correct_i) / Σ(w_i)
+        w_i      = 0.5 ** (i / RECENCY_HALF_LIFE)  ×  difficulty_weight(difficulty_i)
+
+    `difficulties` is a parallel newest-first list of recorded question difficulties. Omitting
+    it (or passing None for an entry) applies the neutral weight, which reproduces the
+    pure-recency behaviour exactly -- so existing callers and pre-snapshot answer histories are
+    unaffected.
 
     Returns None for an empty sequence -- "no evidence" is not 0%, and conflating the two
     is exactly the mistake that made never-assessed sections invisible.
@@ -127,7 +182,8 @@ def weighted_accuracy(sequence):
     numerator = 0.0
     denominator = 0.0
     for index, correct in enumerate(sequence):
-        weight = _RECENCY_DECAY ** index
+        difficulty = difficulties[index] if difficulties is not None and index < len(difficulties) else None
+        weight = (_RECENCY_DECAY ** index) * difficulty_weight(difficulty)
         denominator += weight
         if correct:
             numerator += weight
@@ -158,7 +214,7 @@ def _learning_gain(sequence):
     return initial, current, round(current - initial, 1)
 
 
-def _classify(answered, correct, lifetime, weighted, mastery):
+def _classify(answered, correct, lifetime, weighted, mastery, difficulty_weighted=False):
     """Map observed performance onto a priority plus the sentence explaining it.
 
     The decision metric is `weighted` (recency-weighted accuracy). `lifetime` is carried
@@ -201,9 +257,13 @@ def _classify(answered, correct, lifetime, weighted, mastery):
 
     # How the two accuracy figures are described, so the reason never looks like a typo
     # when they diverge.
+    # Name the weighting that was actually applied. A learner told their score is
+    # "difficulty-weighted" when no difficulty was recorded would be misled, so the phrase only
+    # appears when it is true.
+    basis = "recency- and difficulty-weighted" if difficulty_weighted else "recency-weighted"
     if abs(weighted - lifetime) >= 0.1:
         measure = (
-            f"{weighted}% recency-weighted accuracy "
+            f"{weighted}% {basis} accuracy "
             f"({correct}/{answered} correct overall = {lifetime}% lifetime)"
         )
     else:
@@ -245,7 +305,7 @@ def analyse_sections(learner, sop, job_role):
     approved questions are considered -- a section with nothing to ask about cannot be
     trained on, and listing it would just be noise in the explanation.
     """
-    history = _answer_history_by_chunk(learner, sop, job_role)
+    history, difficulties_by_chunk = _answer_history_by_chunk(learner, sop, job_role)
     now = timezone.now()
     masteries = {
         m.sop_chunk_id: m
@@ -278,12 +338,20 @@ def analyse_sections(learner, sop, job_role):
     sections = []
     for chunk_id, question_ids in questions_by_chunk.items():
         sequence = history.get(chunk_id, [])  # newest-first
+        difficulties = difficulties_by_chunk.get(chunk_id, [])
         answered = len(sequence)
         correct = sum(1 for c in sequence if c)
         lifetime = _plain_accuracy(sequence)
-        weighted = weighted_accuracy(sequence)
+        weighted = weighted_accuracy(sequence, difficulties)
         mastery = masteries.get(chunk_id)
-        priority, reason = _classify(answered, correct, lifetime, weighted, mastery)
+        # Whether difficulty actually influenced this section's figure, so the explanation can
+        # say so honestly rather than implying a weighting that did not happen.
+        recorded_difficulties = [d for d in difficulties if d is not None]
+        difficulty_weighted = bool(recorded_difficulties)
+        priority, reason = _classify(
+            answered, correct, lifetime, weighted, mastery,
+            difficulty_weighted=difficulty_weighted,
+        )
         initial, current, improvement = _learning_gain(sequence)
 
         # Section-level due-ness, from this section's own FSRS schedule. A section with no
@@ -305,6 +373,14 @@ def analyse_sections(learner, sop, job_role):
                 "weighted_accuracy": weighted,
                 "recent_accuracy": _plain_accuracy(sequence[:RECENT_WINDOW]),
                 "evidence_sufficient": answered >= MIN_EVIDENCE,
+                # Whether question difficulty influenced this section's adaptive score, and the
+                # mean difficulty of the answers that carried one. Exposed so the UI and an
+                # auditor can see the basis of the decision rather than inferring it.
+                "difficulty_weighted": difficulty_weighted,
+                "mean_difficulty": (
+                    round(sum(recorded_difficulties) / len(recorded_difficulties))
+                    if recorded_difficulties else None
+                ),
                 "initial_accuracy": initial,
                 "current_accuracy": current,
                 "improvement": improvement,

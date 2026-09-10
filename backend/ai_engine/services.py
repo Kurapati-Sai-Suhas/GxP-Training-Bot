@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -7,12 +8,38 @@ import time
 
 from openai import OpenAI
 
+from . import metrics
+
 logger = logging.getLogger(__name__)
 
-NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_NIM_MODEL = "meta/llama-3.1-8b-instruct"
+NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+# The model id is CONFIGURATION, not code.
+#
+# It was previously hardcoded to "meta/llama-3.1-8b-instruct". That model reached end of
+# life on 2026-08-26 and the endpoint now returns HTTP 410 Gone. Because the fallback
+# contract swallows every provider failure, the application kept serving traffic on the
+# deterministic offline generator and nothing surfaced the outage -- correct availability
+# behaviour, but a silent and total loss of the live AI path.
+#
+# Two things follow, and both are implemented here:
+#   1. Rotating a retired model must be an environment change, not a code change and
+#      redeploy. Read at CALL time, not import time, so a running worker picks up a new
+#      value without a rebuild.
+#   2. A retired model must be distinguishable from a transient blip -- see
+#      classify_llm_error's "model_retired" category below.
+#
+# Verified invocable on 2026-09-10 via `manage.py check_ai_provider`.
+DEFAULT_NVIDIA_NIM_MODEL = "openai/gpt-oss-20b"
+NVIDIA_NIM_MODEL = DEFAULT_NVIDIA_NIM_MODEL  # retained for import compatibility
+
 NVIDIA_NIM_MAX_ATTEMPTS = 3
 NVIDIA_NIM_RETRY_BACKOFF_SECONDS = 0.5
+
+
+def nim_model():
+    """The chat/generation model id, resolved at call time from the environment."""
+    return os.getenv("NVIDIA_NIM_MODEL", DEFAULT_NVIDIA_NIM_MODEL)
 
 REQUIRED_KEYS = {"question_text", "options", "correct_option_index", "explanation"}
 
@@ -30,7 +57,21 @@ def classify_llm_error(exc):
     name = type(exc).__name__.lower()
     message = str(exc).lower()
 
-    if "notfound" in name or "model_not_found" in message:
+    # Checked FIRST, and deliberately kept separate from model_not_found.
+    #
+    # A retired model is permanent and operator-actionable: no amount of retrying will fix
+    # it, and the only remedy is to point NVIDIA_NIM_MODEL / NVIDIA_EMBED_MODEL at a
+    # replacement. Before this branch existed, NVIDIA's 410 Gone response fell through to
+    # "unknown" -- indistinguishable from a transient network blip -- which is exactly how
+    # both of this project's models stayed dead without anyone noticing.
+    if "410" in message or "end of life" in message or "no longer available" in message:
+        return "model_retired"
+    # "404" is matched from the message as well as the type name. Every other category here
+    # already keys off the status code in the message (401/403, 429, 500/502/503); 404 alone
+    # relied on the SDK's exception type surviving intact, so a wrapped or re-raised 404
+    # degraded to "unknown". NVIDIA returns 404 for a model that exists in the catalogue but
+    # is not entitled for the account -- a real and distinctly actionable condition.
+    if "notfound" in name or "model_not_found" in message or "404" in message:
         return "model_not_found"
     if "authentication" in name or "permissiondenied" in name or "401" in message or "403" in message:
         return "authentication_failure"
@@ -133,7 +174,7 @@ def generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions
     for attempt in range(1, NVIDIA_NIM_MAX_ATTEMPTS + 1):
         try:
             result = client.chat.completions.create(
-                model=NVIDIA_NIM_MODEL,
+                model=nim_model(),
                 messages=[
                     {"role": "system", "content": "Return strict JSON for a GxP quiz generation task."},
                     {"role": "user", "content": build_quiz_prompt(role_name, sop_chunk, number_of_questions)},
@@ -148,7 +189,7 @@ def generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions
             logger.warning(
                 "NVIDIA NIM quiz generation attempt %s/%s failed (%s): %s",
                 attempt, NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc), exc,
-                extra={"provider": "nvidia_nim", "model": NVIDIA_NIM_MODEL,
+                extra={"provider": "nvidia_nim", "model": nim_model(),
                        "error_category": classify_llm_error(exc), "attempt": attempt},
             )
             if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
@@ -214,15 +255,26 @@ def generate_questions(role_name, sop_chunk, number_of_questions=1):
     Returns (drafts, source) where source is "nvidia_nim" or "mock", so callers can
     surface which path produced the content.
     """
+    started = time.time()
     try:
         drafts = generate_questions_with_nvidia_nim(role_name, sop_chunk, number_of_questions)
+        metrics.record("question_generation", nim_model(), ok=True,
+                       latency_ms=(time.time() - started) * 1000)
         return drafts, "nvidia_nim"
     except Exception as exc:  # noqa: BLE001 - the fallback contract: degrade, never fail
+        category = classify_llm_error(exc)
+        # Recorded on the fallback path too. A fallback rate is only meaningful against a
+        # denominator of total attempts -- and since this path raises nothing to the caller,
+        # this counter is the ONLY thing that can distinguish "AI is working" from "AI has
+        # been dead for a fortnight and we are serving offline questions".
+        metrics.record("question_generation", nim_model(), ok=False,
+                       latency_ms=(time.time() - started) * 1000,
+                       error_category=category, fallback_used=True)
         logger.error(
             "NVIDIA NIM unavailable after %s attempts (%s); falling back to the offline "
             "generator. Questions from this run are marked generation_source='mock'.",
-            NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc),
-            extra={"provider": "nvidia_nim", "error_category": classify_llm_error(exc),
+            NVIDIA_NIM_MAX_ATTEMPTS, category,
+            extra={"provider": "nvidia_nim", "error_category": category,
                    "fallback_used": True},
         )
         return generate_mock_questions(role_name, sop_chunk, number_of_questions), "mock"
@@ -249,16 +301,156 @@ def _significant_words(text):
     return {word.lower() for word in _WORD_PATTERN.findall(text)}
 
 
-def select_relevant_chunks(question, chunks, max_chunks=6):
-    """Rank a SOP's chunks by lexical overlap with the question; ties (including
-    the all-zero-overlap case) keep the chunks' original document order, so a
-    question with no keyword overlap still gets the SOP's opening sections
-    rather than nothing at all."""
-    question_words = _significant_words(question)
-    scored = []
-    for index, chunk in enumerate(chunks):
-        overlap = len(question_words & _significant_words(chunk.chunk_text))
-        scored.append((overlap, -index, chunk))
+def _tokens(text):
+    """Words WITH repeats. BM25 needs term frequency; _significant_words discards it."""
+    return [word.lower() for word in _WORD_PATTERN.findall(text)]
+
+
+# BM25 parameters. These are the standard defaults from the Okapi literature, not values
+# fitted to this corpus -- fitting two free parameters on a 15-query gold set would overfit
+# it, and the gold set is the measuring instrument.
+#   k1 controls term-frequency saturation: repeating a term keeps helping, but with sharply
+#      diminishing returns.
+#   b  controls length normalisation: 0.75 partially corrects for long chunks accumulating
+#      matches simply by being long.
+BM25_K1 = 1.5
+BM25_B = 0.75
+
+
+def _bm25_scores(question, chunks):
+    """Okapi BM25 over one SOP's chunks.
+
+    WHY BM25 AND NOT PLAIN OVERLAP
+    ------------------------------
+    The previous ranker counted how many distinct query words appeared in a chunk. Every
+    word counted equally, so a word appearing in nearly every chunk of the document -- "must",
+    "procedure", "shall", the document's own title words -- contributed exactly as much
+    evidence as a rare, discriminating term like "gowning" or "centrifuge".
+
+    Measured consequence on the gold set (P1-007): query Q01 produced a THREE-WAY TIE at
+    overlap score 3, because the tying chunks matched on common words. The correct chunk
+    could not be separated from two irrelevant ones by a metric that cannot tell a rare term
+    from a stopword.
+
+    BM25 fixes exactly that failure mode with two terms the old ranker lacked:
+      * IDF        -- a term appearing in most chunks carries little weight; a rare term
+                      carries a lot. This is the term that breaks the Q01 tie.
+      * length norm -- a long chunk no longer out-scores a short precise one just by
+                      accumulating incidental matches.
+
+    RESEARCH BASIS
+    --------------
+    Robertson & Zaragoza (2009), "The Probabilistic Relevance Framework: BM25 and Beyond",
+    Foundations and Trends in IR -- the canonical derivation of the scoring function used here.
+
+    Thakur et al. (2021), "BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of
+    Information Retrieval Models", NeurIPS Datasets & Benchmarks -- finds BM25 a robust
+    baseline that dense retrievers frequently FAIL to beat out-of-domain in zero-shot
+    settings. That finding is why this project strengthens lexical retrieval before reaching
+    for embeddings: a pharmaceutical SOP corpus is precisely the narrow, out-of-domain case
+    where BEIR shows zero-shot dense retrieval is weakest. (It is also, separately, the only
+    option currently available -- no NIM embedding model is invocable on this account.)
+
+    The corpus for IDF is the chunk set passed in -- i.e. one SOP's own chunks. That is the
+    correct reference population: "must" being ubiquitous *within this document* is exactly
+    what should discount it when ranking *within this document*.
+    """
+    query_terms = _significant_words(question)
+    if not chunks:
+        return []
+
+    chunk_tokens = [_tokens(chunk.chunk_text) for chunk in chunks]
+    lengths = [len(tokens) for tokens in chunk_tokens]
+    total = len(chunks)
+    avg_length = (sum(lengths) / total) if total else 0.0
+    if avg_length == 0:
+        return [0.0] * total
+
+    term_frequencies = []
+    for tokens in chunk_tokens:
+        counts = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+        term_frequencies.append(counts)
+
+    scores = []
+    for index in range(total):
+        counts = term_frequencies[index]
+        length = lengths[index]
+        score = 0.0
+        for term in query_terms:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            # Document frequency: how many chunks contain this term at all.
+            containing = sum(1 for tf in term_frequencies if term in tf)
+            # Robertson/Sparck-Jones IDF, the +1 form -- always positive, so a term present
+            # in every chunk contributes ~0 rather than a negative score that would perversely
+            # penalise a chunk for containing a query term.
+            idf = math.log(1 + (total - containing + 0.5) / (containing + 0.5))
+            denominator = frequency + BM25_K1 * (1 - BM25_B + BM25_B * length / avg_length)
+            score += idf * (frequency * (BM25_K1 + 1)) / denominator
+        scores.append(score)
+    return scores
+
+
+def _overlap_scores(question, chunks):
+    """The pre-BM25 ranker: count of distinct query words present. Retained so the two can
+    be compared on the gold set rather than swapped on assertion."""
+    query_terms = _significant_words(question)
+    return [float(len(query_terms & _significant_words(chunk.chunk_text))) for chunk in chunks]
+
+
+RANKERS = {"bm25": _bm25_scores, "overlap": _overlap_scores}
+
+# MEASURED DECISION — BM25 was implemented, evaluated, and REJECTED.
+#
+# The hypothesis was that IDF would break the three-way tie at overlap score 3 that P1-007
+# identified as the cause of the Q01 failure. It did not. BM25 lost on every configuration
+# tested, on both the live corpus and the post-P2-001 corrected chunking.
+#
+#   Corrected chunking (11 chunks, 14 scored queries, gold set v1.0, max_chunks=6)
+#     ranker                Hit@1     R@3      MRR
+#     overlap  (adopted)   0.8571     1.0   0.9286
+#     bm25 b=0.75          0.8571     1.0   0.9048
+#     bm25 b=0.50          0.8571     1.0   0.9048
+#     bm25 b=0.25          0.8571     1.0   0.9048
+#     bm25 b=0             0.8571     1.0   0.9167
+#
+# Two distinct reasons, both properties of THIS corpus rather than defects in BM25:
+#
+#   1. IDF needs a corpus to be a statistic over. Each SOP holds 4-5 chunks, so document
+#      frequency takes about three distinct values and the resulting IDF weights span a
+#      range too narrow to separate anything. Q01 ranked WORSE under every BM25 variant.
+#
+#   2. Length normalisation actively harms this corpus. On the live (pre-P2-001) corpus,
+#      6-token title-only chunks scored 2.885 against the correct chunk's 1.472 purely
+#      because they were short. Chunk length here reflects how much a section says, not
+#      verbosity, which is the assumption b encodes.
+#
+# b was swept only to attribute the regression, never to select a value: fitting a free
+# parameter on a 15-query gold set would overfit the measuring instrument itself.
+#
+# Kept, not deleted, because the negative result is the evidence for the current design and
+# should be re-runnable when the corpus grows. Thakur et al. (BEIR, NeurIPS 2021) find BM25
+# a robust baseline at realistic corpus scale -- this deployment is three orders of magnitude
+# below that scale, which is precisely why the finding did not transfer.
+#
+# Re-run before revisiting: scratchpad/bm25_corrected.py
+DEFAULT_RANKER = "overlap"
+
+
+def select_relevant_chunks(question, chunks, max_chunks=6, ranker=None):
+    """Rank a SOP's chunks against the question; ties (including the all-zero-score case)
+    keep the chunks' original document order, so a question with no keyword overlap still
+    gets the SOP's opening sections rather than nothing at all.
+
+    `ranker` selects the scoring function (see RANKERS) and exists so the evaluation harness
+    can measure one against the other on a fixed gold set. Production uses the default.
+    """
+    score_fn = RANKERS[ranker or DEFAULT_RANKER]
+    scores = score_fn(question, chunks)
+    scored = [(scores[index], -index, chunk) for index, chunk in enumerate(chunks)]
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [chunk for _score, _index, chunk in scored[:max_chunks]]
 
@@ -295,7 +487,7 @@ def answer_sop_question_with_nvidia_nim(sop_title, question, chunks):
     for attempt in range(1, NVIDIA_NIM_MAX_ATTEMPTS + 1):
         try:
             result = client.chat.completions.create(
-                model=NVIDIA_NIM_MODEL,
+                model=nim_model(),
                 messages=[
                     {"role": "system", "content": "Answer strictly from the provided SOP text."},
                     {"role": "user", "content": build_sop_chat_prompt(sop_title, question, relevant_chunks)},
@@ -310,7 +502,7 @@ def answer_sop_question_with_nvidia_nim(sop_title, question, chunks):
             logger.warning(
                 "NVIDIA NIM SOP chat attempt %s/%s failed (%s): %s",
                 attempt, NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc), exc,
-                extra={"provider": "nvidia_nim", "model": NVIDIA_NIM_MODEL,
+                extra={"provider": "nvidia_nim", "model": nim_model(),
                        "error_category": classify_llm_error(exc), "attempt": attempt},
             )
             if attempt < NVIDIA_NIM_MAX_ATTEMPTS:
@@ -337,15 +529,22 @@ def answer_sop_question_offline(question, chunks):
 def answer_sop_question(sop_title, question, chunks):
     """Try the live NVIDIA NIM chatbot; fall back to a deterministic chunk quote
     on any failure. Returns (answer, sections_used, source)."""
+    started = time.time()
     try:
         answer, sections_used = answer_sop_question_with_nvidia_nim(sop_title, question, chunks)
+        metrics.record("sop_chat", nim_model(), ok=True,
+                       latency_ms=(time.time() - started) * 1000)
         return answer, sections_used, "nvidia_nim"
     except Exception as exc:  # noqa: BLE001 - the fallback contract: degrade, never fail
+        category = classify_llm_error(exc)
+        metrics.record("sop_chat", nim_model(), ok=False,
+                       latency_ms=(time.time() - started) * 1000,
+                       error_category=category, fallback_used=True)
         logger.error(
             "NVIDIA NIM unavailable for SOP chat after %s attempts (%s); answering from the "
             "best-matching chunk instead.",
-            NVIDIA_NIM_MAX_ATTEMPTS, classify_llm_error(exc),
-            extra={"provider": "nvidia_nim", "error_category": classify_llm_error(exc),
+            NVIDIA_NIM_MAX_ATTEMPTS, category,
+            extra={"provider": "nvidia_nim", "error_category": category,
                    "fallback_used": True},
         )
         answer, sections_used = answer_sop_question_offline(question, chunks)

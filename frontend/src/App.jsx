@@ -1383,7 +1383,13 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
     setIsStarting(true);
     try {
       const created = await createQuizAttempt({ sop: Number(sopId), jobRole: jobRole.id });
-      const snapshot = approvedQuestions.filter((question) => String(question.sop) === String(sopId));
+      // Render exactly the set the server recorded for this attempt, in the order it was
+      // served. Previously the browser assembled its own set, so what was displayed and
+      // what the server would accept at submission could differ; the server now rejects a
+      // submission that does not match the recorded set exactly.
+      const offered = created.offered_question_ids ?? [];
+      const byId = new Map(approvedQuestions.map((question) => [question.id, question]));
+      const snapshot = offered.map((id) => byId.get(id)).filter(Boolean);
       setAttempt({ id: created.id, questions: snapshot });
       setIndex(0);
       setAnswers({});
@@ -1425,12 +1431,14 @@ function LearnerQuiz({ currentUser, onSubmitted }) {
     // requiring a separate Start Quiz click. When the backend found specific
     // previously-missed questions (item.targeted), retest only those instead of the
     // whole SOP quiz.
-    const bySop = approvedQuestions.filter((question) => String(question.sop) === String(item.sop_id));
-    const snapshot = item.targeted && item.question_ids?.length
-      ? bySop.filter((question) => item.question_ids.includes(question.id))
-      : bySop;
+    // item.question_ids is the attempt's persisted offered set, returned by the server.
+    // There is deliberately no fall-back to "every question for this SOP": doing so would
+    // display a set the server will reject, since submission must match the recorded set
+    // exactly.
+    const byId = new Map(approvedQuestions.map((question) => [question.id, question]));
+    const snapshot = (item.question_ids ?? []).map((id) => byId.get(id)).filter(Boolean);
     setActionError(null);
-    setAttempt({ id: item.attempt_id, questions: snapshot.length ? snapshot : bySop });
+    setAttempt({ id: item.attempt_id, questions: snapshot });
     setIndex(0);
     setAnswers({});
     setResult(null);
@@ -1989,10 +1997,24 @@ function SectionCard({ section }) {
           <>
             {/* The weighted figure is labelled as the deciding one, so the display can
                 never appear to contradict the priority beside it. */}
-            <span title="Recency-weighted accuracy — the figure the priority is decided on">
+            <span
+              title={
+                section.difficulty_weighted
+                  ? "Recency- and difficulty-weighted accuracy — the figure the priority is decided on. Harder questions count for more."
+                  : "Recency-weighted accuracy — the figure the priority is decided on"
+              }
+            >
               Adaptive score: <strong>{section.weighted_accuracy}%</strong>
             </span>
             <span>Lifetime: <strong>{section.accuracy}%</strong></span>
+            {/* Shown only when difficulty actually influenced the score, so the learner is
+                never told their result was difficulty-weighted when no difficulty was
+                recorded for those answers. */}
+            {section.difficulty_weighted && section.mean_difficulty !== null && (
+              <span title="Average recorded difficulty of the answers behind this score. Harder questions carry more weight.">
+                Avg difficulty: <strong>{section.mean_difficulty}</strong>
+              </span>
+            )}
             {section.recent_accuracy !== null && (
               <span>Recent {section.answered < 5 ? section.answered : 5}: <strong>{section.recent_accuracy}%</strong></span>
             )}

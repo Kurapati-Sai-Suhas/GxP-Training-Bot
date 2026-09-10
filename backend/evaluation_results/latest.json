@@ -1,0 +1,80 @@
+{
+  "generated_at": "2026-08-19T11:52:42.425985+05:30",
+  "status": "INSUFFICIENT_DATA",
+  "blockers": [
+    "evaluation split has 0 interactions, below the 100 required",
+    "minority class has 0 observations, below the 20 required",
+    "0 learners with usable sequences, below the 5 required"
+  ],
+  "dataset": {
+    "total_rows": 51,
+    "usable": 0,
+    "excluded_synthetic": 27,
+    "excluded_no_timestamp": 24,
+    "excluded_no_snapshot": 0,
+    "excluded_short_sequence": 0,
+    "learners": 0,
+    "sequence_lengths": {},
+    "train_interactions": 0,
+    "eval_interactions": 0,
+    "eval_positives": 0,
+    "eval_negatives": 0
+  },
+  "split": {
+    "type": "per-learner temporal",
+    "train_fraction": 0.7,
+    "ordering_field": "answered_at",
+    "note": "No random splitting. A learner's later answers are never used to predict their earlier ones."
+  },
+  "thresholds": {
+    "min_eval_samples": 100,
+    "min_per_class": 20,
+    "min_learners": 5,
+    "min_sequence_length": 5
+  },
+  "leakage_controls": [
+    "Features for interaction i are built from interactions 0..i-1 only.",
+    "Difficulty and ability come from AttemptAnswer snapshots captured before the Elo update, never from the live Question/TopicMastery ratings.",
+    "Rows without answered_at or without snapshots are excluded, never imputed.",
+    "Synthetic demo interactions (QuizAttempt.is_synthetic) are excluded by default.",
+    "The target (is_correct) is never exposed to any baseline as an input."
+  ],
+  "baselines": {
+    "current_rule_engine": {
+      "description": "Rule-based decision layer over recency-weighted accuracy (half-life 5.0, MIN_EVIDENCE 3). Not a trained model.",
+      "predicts": "P(correct) read from the engine's own recency-weighted accuracy for that chunk",
+      "metrics": {
+        "roc_auc": "insufficient_data",
+        "pr_auc": "insufficient_data",
+        "log_loss": "insufficient_data",
+        "brier": "insufficient_data"
+      },
+      "calibration": "insufficient_data",
+      "interpretation": "Computed for mechanism verification only. NOT a performance claim -- the dataset is below the documented sufficiency thresholds."
+    },
+    "elo": {
+      "description": "Elo expected score from pre-answer ability and difficulty snapshots.",
+      "predicts": "P(correct) = 1 / (1 + 10^((difficulty - ability)/400))",
+      "metrics": {
+        "roc_auc": "insufficient_data",
+        "pr_auc": "insufficient_data",
+        "log_loss": "insufficient_data",
+        "brier": "insufficient_data"
+      },
+      "calibration": "insufficient_data",
+      "interpretation": "Computed for mechanism verification only. NOT a performance claim -- the dataset is below the documented sufficiency thresholds."
+    },
+    "logistic_pfa": {
+      "description": "Logistic regression on prior counts and pre-answer snapshots. PFA-style, not BKT and not knowledge tracing.",
+      "predicts": "P(correct | prior correct, prior incorrect, difficulty, ability)",
+      "metrics": {
+        "roc_auc": "insufficient_data",
+        "pr_auc": "insufficient_data",
+        "log_loss": "insufficient_data",
+        "brier": "insufficient_data"
+      },
+      "calibration": "insufficient_data",
+      "interpretation": "Computed for mechanism verification only. NOT a performance claim -- the dataset is below the documented sufficiency thresholds."
+    }
+  }
+}

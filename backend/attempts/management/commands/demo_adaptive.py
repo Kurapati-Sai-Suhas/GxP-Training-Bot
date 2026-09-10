@@ -34,6 +34,8 @@ from quiz.models import Option, Question
 from sops.models import SOPChunk, SOPDocument
 from sops.tasks import process_sop_document_task
 
+ALL_DIFFICULTIES = object()  # sentinel: every question in the section answered correctly
+
 DEMO_SOP_CODE = "SOP-DEMO"
 DEMO_USERS = ["demo_sme", "demo_learner"]
 
@@ -218,18 +220,61 @@ class Command(BaseCommand):
             return correct
         return next((o for o in options if not o.is_correct), correct)
 
+    @staticmethod
+    def _answers_correctly(section_title, question, correct_sections):
+        """Decide whether the simulated learner gets this question right.
+
+        `correct_sections` accepts two shapes:
+
+          * a set of section titles -- every question in those sections is answered
+            correctly (the original all-or-nothing behaviour, still used by retraining);
+          * a dict mapping a section title to either ALL_DIFFICULTIES or an explicit set of
+            question ids answered correctly.
+
+        Question ids rather than difficulty labels, because the labels come from the LLM and
+        vary between generation runs -- a section may contain no "hard" question at all. The
+        caller selects by the questions' actual recorded difficulty (see step 6), which is
+        stable whatever the model chose to call them.
+        """
+        if isinstance(correct_sections, dict):
+            allowed = correct_sections.get(section_title)
+            if allowed is None:
+                return False
+            if allowed is ALL_DIFFICULTIES:
+                return True
+            return question.id in allowed
+        return section_title in correct_sections
+
     def _take_quiz(self, learner, sop, role, questions, correct_sections, label):
         """Runs the real grading and mastery pipeline (mirrors QuizAttemptViewSet.submit)."""
-        attempt = QuizAttempt.objects.create(learner=learner, sop=sop, job_role=role)
+        # is_synthetic marks every row this command produces. The outcomes below are decided by
+        # the script rather than observed, so they demonstrate the loop but must never be
+        # mistaken for evidence about learning -- the evaluation harness excludes them.
+        attempt = QuizAttempt.objects.create(
+            learner=learner, sop=sop, job_role=role, is_synthetic=True,
+        )
         answered = []
         correct_count = 0
+        # Ability as it stands before this attempt's answers move it, mirroring submit().
+        prior_mastery = TopicMastery.objects.filter(learner=learner, sop=sop).first()
+        ability_at_answer = (
+            prior_mastery.elo_rating if prior_mastery is not None
+            else TopicMastery._meta.get_field("elo_rating").default
+        )
         for section_title, section_questions in questions.items():
-            answer_correctly = section_title in correct_sections
             for question in section_questions:
+                answer_correctly = self._answers_correctly(
+                    section_title, question, correct_sections)
                 option = self._answer(question, answer_correctly)
                 is_correct = bool(option and option.is_correct)
                 AttemptAnswer.objects.create(
                     attempt=attempt, question=question, selected_option=option, is_correct=is_correct,
+                    # The demo mirrors the real submission pipeline, so it records the same
+                    # pre-update snapshots. These are truthful for the sequence it simulates --
+                    # the command controls the order and reads the ratings before moving them.
+                    answered_at=timezone.now(),
+                    question_difficulty_at_answer=question.elo_rating,
+                    learner_ability_at_answer=ability_at_answer,
                 )
                 answered.append((question, is_correct))
                 correct_count += 1 if is_correct else 0
@@ -273,8 +318,44 @@ class Command(BaseCommand):
     def step_6_first_attempt(self, learner, sop, role, by_section):
         self.step(6, "Learner takes the quiz - strong on GMP, weak on CAPA and Documentation")
         strong = [t for t in by_section if "Good Manufacturing" in t or "GMP" in t]
-        self.detail(f"Answering correctly only in: {strong or '(none detected)'}")
-        self._take_quiz(learner, sop, role, by_section, set(strong), "Attempt 1")
+        weak = [t for t in by_section if t not in strong]
+
+        # Both weak sections are answered exactly 1 of 3 -- identical lifetime accuracy --
+        # but the single correct answer is the HARDEST question in one section and the
+        # EASIEST in the other. That is the whole point of the scenario: it is the only
+        # arrangement in which difficulty weighting is observable, because at 0% or 100% a
+        # weighted average equals an unweighted one whatever the weights are.
+        #
+        # Selection is by each question's actual difficulty rating rather than by its label,
+        # since the LLM's easy/medium/hard labels vary between generation runs and a section
+        # may contain no "hard" question at all.
+        #
+        # The resulting priorities are whatever the production algorithm decides. Nothing
+        # here sets a priority, a score or a weight.
+        scenario = {title: ALL_DIFFICULTIES for title in strong}
+        descriptions = {}
+        for index, title in enumerate(weak):
+            ranked = sorted(by_section[title], key=lambda q: q.elo_rating)
+            if not ranked:
+                scenario[title] = set()
+                continue
+            if index == 0:
+                chosen, label = ranked[-1], "hardest"
+            elif index == 1:
+                chosen, label = ranked[0], "easiest"
+            else:
+                scenario[title] = set()
+                continue
+            scenario[title] = {chosen.id}
+            descriptions[title] = (label, chosen.difficulty, chosen.elo_rating)
+
+        self.detail(f"Answering everything correctly in: {strong or '(none detected)'}")
+        for title, (label, difficulty_label, rating) in descriptions.items():
+            self.detail(
+                f"In {title}: answering only the {label} question correctly "
+                f"({difficulty_label}, difficulty {rating:.0f})"
+            )
+        self._take_quiz(learner, sop, role, by_section, scenario, "Attempt 1")
 
     def step_7_show_mastery(self, learner, sop):
         self.step(7, "Server-side grading updates per-section mastery")
@@ -299,7 +380,52 @@ class Command(BaseCommand):
                 f"     measured : adaptive score {section['weighted_accuracy']}% "
                 f"| lifetime {section['accuracy']}% | {section['correct']}/{section['answered']} correct"
             )
+            self._show_difficulty_breakdown(learner, section)
             self.detail(f"     evidence : {section['reason']}")
+        self._show_difficulty_comparison(learner, sop, role)
+
+    def _show_difficulty_breakdown(self, learner, section):
+        """Per-answer difficulty behind a section's score, so the weighting is visible rather
+        than asserted. Every value is read back from the recorded interactions."""
+        if section["chunk_id"] is None or not section["difficulty_weighted"]:
+            return
+        answers = (
+            AttemptAnswer.objects
+            .filter(attempt__learner=learner, question__source_chunk_id=section["chunk_id"])
+            .select_related("question").order_by("-id")
+        )
+        parts = []
+        for answer in answers:
+            weight = adaptive.difficulty_weight(answer.question_difficulty_at_answer)
+            parts.append(
+                f"{answer.question.difficulty}({answer.question_difficulty_at_answer:.0f}, "
+                f"w={weight:.2f}) {'OK' if answer.is_correct else 'X '}"
+            )
+        self.detail(f"     answers  : {' | '.join(parts)}")
+        self.detail(f"     avg diff : {section['mean_difficulty']}")
+
+    def _show_difficulty_comparison(self, learner, sop, role):
+        """The point of the scenario: two sections with identical lifetime accuracy whose
+        adaptive scores differ purely because of which questions were answered correctly."""
+        sections = [
+            s for s in adaptive.analyse_sections(learner, sop, role)
+            if s["difficulty_weighted"] and s["answered"]
+        ]
+        by_lifetime = {}
+        for section in sections:
+            by_lifetime.setdefault(section["accuracy"], []).append(section)
+        comparable = [group for group in by_lifetime.values() if len(group) >= 2]
+        if not comparable:
+            return
+        self.stdout.write("")
+        self.detail("Difficulty-aware evidence (same lifetime accuracy, different weighting):")
+        for group in comparable:
+            for section in group:
+                self.detail(
+                    f"  {section['section_title'][:44]:<44} "
+                    f"lifetime {section['accuracy']}%  ->  adaptive {section['weighted_accuracy']}%  "
+                    f"[{section['priority'].upper()}]"
+                )
 
     def step_9_retraining_selection(self, learner, sop, role):
         self.step(9, "Adaptive retraining selection")

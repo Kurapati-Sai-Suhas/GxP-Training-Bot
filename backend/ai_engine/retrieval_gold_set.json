@@ -1,0 +1,149 @@
+{
+  "version": "1.0",
+  "created": "2026-08-19",
+  "curated_by": "manual",
+  "corpus": {
+    "sop_codes": ["SOP-300", "SOP-204", "SOP-208"],
+    "excluded": {
+      "SOP-DEMO": "Synthetic demo content. demo_adaptive wipes and regenerates it on every run, so any label keyed to it would break.",
+      "SOP-211": "Single chunk — retrieval is trivial with one candidate.",
+      "SOP-214": "Single chunk — retrieval is trivial with one candidate.",
+      "SOP-217": "Single chunk — retrieval is trivial with one candidate.",
+      "SOP-198": "No chunks — never processed."
+    }
+  },
+  "labelling": {
+    "query": "A natural-language question a learner could plausibly ask the SOP chatbot.",
+    "relevant": "A chunk that contains the information needed to answer the query. Labelled manually by reading the chunk text, never by asking a model.",
+    "keying": "Chunks are referenced by (sop_code, section_title), not by primary key, so the gold set survives a database reseed.",
+    "multiple_relevant": "Permitted. Some queries span two sections and both are labelled.",
+    "leakage": "Category records how much vocabulary the query shares with its target. exact_terminology reuses the SOP's own words; paraphrase deliberately avoids them. Reporting results by category is the point — an aggregate score would hide where lexical matching breaks.",
+    "provenance": "Every expectation resolves to sop_code + section_title + chunk id at load time, so a retrieved chunk is always traceable to its source document and section."
+  },
+  "honesty": {
+    "nature": "This is an evaluation gold set over SEED content, not production data. The SOP text was authored for this project's demo fixtures; it is not a real pharmaceutical corpus.",
+    "size": "15 queries over 14 chunks in 3 documents. Small by design and by necessity — it is auditable, not statistically representative. No confidence intervals are computed from it."
+  },
+  "queries": [
+    {
+      "id": "Q01",
+      "query": "What order must garments be put on for cleanroom entry?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 2: Gowning Sequence"],
+      "category": "exact_terminology",
+      "notes": "Query reuses 'order' and 'garments' from the chunk. Lexical matching should find this easily."
+    },
+    {
+      "id": "Q02",
+      "query": "How long can a person stay inside the Grade B area before they must come out?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 3: Time Limit"],
+      "category": "paraphrase",
+      "notes": "The chunk says 'a single gowning cycle ... is limited to a maximum of four hours'. The query says none of that except 'Grade B'. Tests whether meaning survives without shared vocabulary."
+    },
+    {
+      "id": "Q03",
+      "query": "What should an operator do if their glove is torn?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 4: Glove Breach"],
+      "category": "exact_terminology",
+      "notes": "'torn', 'glove', 'operator' all appear verbatim."
+    },
+    {
+      "id": "Q04",
+      "query": "Which grade of cleanroom does this procedure cover?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 1: Purpose"],
+      "category": "exact_terminology",
+      "notes": "'cleanroom' and 'Grade' both present; 'Grade' is 5 letters so it is indexed."
+    },
+    {
+      "id": "Q05",
+      "query": "Are gloves put on first or last?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 2: Gowning Sequence"],
+      "category": "ambiguous_short",
+      "notes": "Short query, few indexable words ('gloves', 'first', 'last'). Tests behaviour when the query carries little lexical signal."
+    },
+    {
+      "id": "Q06",
+      "query": "How often must HPLC instruments be calibrated?",
+      "sop_code": "SOP-204",
+      "relevant_sections": ["Section 2: Calibration Frequency"],
+      "category": "exact_terminology",
+      "notes": "'calibrated'/'calibration' and 'HPLC' present. Note HPLC is 4 letters so it is indexed."
+    },
+    {
+      "id": "Q07",
+      "query": "What is the acceptance limit for the tailing factor?",
+      "sop_code": "SOP-204",
+      "relevant_sections": ["Section 3: System Suitability"],
+      "category": "uncommon_terminology",
+      "notes": "'tailing factor' is domain jargon appearing in exactly one chunk. Should be an easy win for lexical matching, and a useful contrast with the paraphrase cases."
+    },
+    {
+      "id": "Q08",
+      "query": "Who has to countersign the results?",
+      "sop_code": "SOP-204",
+      "relevant_sections": ["Section 4: Documentation"],
+      "category": "exact_terminology",
+      "notes": "'countersigned' vs 'countersign' — the pattern indexes whole words, so these do NOT match. Tests the absence of stemming."
+    },
+    {
+      "id": "Q09",
+      "query": "What has to happen before a sample can be analysed?",
+      "sop_code": "SOP-204",
+      "relevant_sections": ["Section 3: System Suitability"],
+      "category": "paraphrase",
+      "notes": "Chunk says 'Before any sample analysis, a system suitability test must be run'. 'analysed' does not match 'analysis' without stemming."
+    },
+    {
+      "id": "Q10",
+      "query": "What must be checked when a delivery arrives at the dock?",
+      "sop_code": "SOP-208",
+      "relevant_sections": ["Section 2: Receipt Inspection"],
+      "category": "paraphrase",
+      "notes": "'delivery' does not appear; the chunk says 'Upon arrival ... verify the shipment against the purchase order'."
+    },
+    {
+      "id": "Q11",
+      "query": "How must incoming pallets be labelled?",
+      "sop_code": "SOP-208",
+      "relevant_sections": ["Section 3: Quarantine Labeling"],
+      "category": "exact_terminology",
+      "notes": "'pallet' and 'incoming' appear verbatim. British 'labelled' vs American 'labeled' does not match — a real-world spelling trap."
+    },
+    {
+      "id": "Q12",
+      "query": "What is the purpose of the warehouse receipt procedure and what must be inspected?",
+      "sop_code": "SOP-208",
+      "relevant_sections": ["Section 1: Purpose", "Section 2: Receipt Inspection"],
+      "category": "multi_section",
+      "notes": "Deliberately spans two sections; both are labelled relevant. Tests whether a single ranked list can serve a compound question."
+    },
+    {
+      "id": "Q13",
+      "query": "What are the gowning rules and how long may the cycle last?",
+      "sop_code": "SOP-300",
+      "relevant_sections": ["Section 2: Gowning Sequence", "Section 3: Time Limit"],
+      "category": "multi_section",
+      "notes": "Two-concept query across gowning order and time limit."
+    },
+    {
+      "id": "Q14",
+      "query": "What is the annual leave policy for warehouse staff?",
+      "sop_code": "SOP-208",
+      "relevant_sections": [],
+      "category": "irrelevant",
+      "notes": "Nothing in this SOP answers it. Retrieval currently always returns chunks, so this measures whether the system can signal 'no evidence' — it cannot. Expected relevant set is deliberately empty."
+    },
+    {
+      "id": "Q15",
+      "query": "Describe the documentation requirements for chromatograms.",
+      "sop_code": "SOP-204",
+      "relevant_sections": ["Section 4: Documentation"],
+      "category": "exact_terminology",
+      "notes": "'chromatograms' and 'documented'/'documentation' present."
+    }
+  ]
+}

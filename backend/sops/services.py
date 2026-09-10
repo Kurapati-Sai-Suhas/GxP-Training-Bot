@@ -14,8 +14,29 @@ HEADING_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+# Embedding model id is CONFIGURATION, not code -- same reasoning as ai_engine.services.
+#
+# "nvidia/nv-embedqa-e5-v5" was hardcoded here and reached end of life on 2026-08-25; the
+# endpoint returns HTTP 410 Gone. The chunking cascade absorbed it exactly as designed and
+# fell through to fixed-length splitting, so no document failed to process -- but tier 2 of
+# a three-tier cascade had been silently dead, and every affected chunk was recorded with
+# chunking_strategy='fixed_length' rather than 'semantic'.
+#
+# MEASURED STATUS 2026-09-10: no embedding model in the NIM catalogue is invocable on this
+# account -- every candidate returns HTTP 404 at call time despite being listed. Semantic
+# chunking is therefore UNAVAILABLE, not merely misconfigured. The default below names the
+# documented successor so the cascade recovers automatically if entitlement is granted;
+# until then the heading-aware tier (which handles every SOP in the current corpus) and the
+# fixed-length tier carry the load. `manage.py check_ai_provider` reports this state.
+DEFAULT_NVIDIA_EMBED_MODEL = "nvidia/llama-3.2-nv-embedqa-1b-v1"
+NVIDIA_EMBED_MODEL = DEFAULT_NVIDIA_EMBED_MODEL  # retained for import compatibility
+
+
+def embed_model():
+    """The embedding model id, resolved at call time from the environment."""
+    return os.getenv("NVIDIA_EMBED_MODEL", DEFAULT_NVIDIA_EMBED_MODEL)
 # Cosine-similarity floor for a sentence to join the current semantic chunk (Max-Min
 # chunking; see _chunk_by_semantic_similarity below).
 SEMANTIC_CHUNK_SIMILARITY_THRESHOLD = 0.5
@@ -78,7 +99,7 @@ def _embed_sentences(sentences):
         raise RuntimeError("NVIDIA_API_KEY is not configured")
     client = OpenAI(api_key=api_key, base_url=NVIDIA_NIM_BASE_URL)
     result = client.embeddings.create(
-        model=NVIDIA_EMBED_MODEL,
+        model=embed_model(),
         input=sentences,
         extra_body={"input_type": "passage", "truncate": "END"},
     )
@@ -107,7 +128,7 @@ def _chunk_by_semantic_similarity(lines, max_chars):
             "Semantic chunking unavailable (%s): %s. Falling back to fixed-length splitting; "
             "affected chunks are recorded with chunking_strategy='fixed_length'.",
             classify_llm_error(exc), exc,
-            extra={"provider": "nvidia_nim", "model": NVIDIA_EMBED_MODEL,
+            extra={"provider": "nvidia_nim", "model": embed_model(),
                    "error_category": classify_llm_error(exc), "fallback_used": True},
         )
         return None
@@ -160,6 +181,29 @@ def chunk_text(text, max_chars=1200):
             current_lines.append(line)
     if current_lines:
         sections.append((current_title, current_lines))
+
+    # Fold a heading-less preamble into the first real section rather than leaving it as a
+    # standalone chunk.
+    #
+    # Real SOPs open with a document title ("Standard Operating Procedure: Cleanroom Entry and
+    # Gowning"), which does not match HEADING_PATTERN and so became its own chunk titled
+    # "Auto chunk 1". That chunk is pure title text, and a learner's question naturally repeats
+    # the document's title words -- so it outranked genuine content on lexical overlap. Measured
+    # on the retrieval gold set (P2-001): the query "What is the purpose of the warehouse receipt
+    # procedure and what must be inspected?" ranked the title chunk first and the correct section
+    # second. Merging lifted Hit@1 from 0.786 to 0.857 and MRR from 0.893 to 0.929, and removed
+    # all three title-only chunks from the corpus.
+    #
+    # Merged rather than discarded: the title text is genuine document content and stays
+    # searchable, just attributed to the section it introduces instead of standing alone.
+    # Discarding it scored identically but destroys information, so it was rejected.
+    #
+    # Only applies when a real heading exists. A document with no headings at all still takes
+    # the semantic/fixed-length path below, unchanged.
+    if len(sections) > 1 and sections[0][0] is None:
+        preamble_lines = sections[0][1]
+        first_title, first_lines = sections[1]
+        sections = [(first_title, preamble_lines + first_lines)] + sections[2:]
 
     if len(sections) == 1 and sections[0][0] is None:
         semantic_chunks = _chunk_by_semantic_similarity(lines, max_chars)

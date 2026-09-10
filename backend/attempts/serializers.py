@@ -49,8 +49,18 @@ class AttemptAnswerSerializer(serializers.ModelSerializer):
 
 class QuizAttemptSerializer(serializers.ModelSerializer):
     answers = AttemptAnswerSerializer(many=True, read_only=True)
+    # The exact question set the server recorded for this attempt, in the order it was
+    # served. The client renders this rather than assembling a set of its own, so what the
+    # learner sees and what the server will accept at submission cannot drift apart.
+    offered_question_ids = serializers.SerializerMethodField()
 
     class Meta:
         model = QuizAttempt
-        fields = ["id", "learner", "job_role", "sop", "score", "started_at", "completed_at", "answers"]
+        fields = [
+            "id", "learner", "job_role", "sop", "score", "started_at", "completed_at",
+            "offered_question_ids", "answers",
+        ]
         read_only_fields = ["learner", "score", "started_at", "completed_at"]
+
+    def get_offered_question_ids(self, obj):
+        return [row.question_id for row in obj.offered_questions.all()]

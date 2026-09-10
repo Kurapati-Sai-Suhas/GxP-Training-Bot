@@ -1,4 +1,6 @@
 import datetime
+import json
+import math
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -10,9 +12,30 @@ from accounts.models import JobRole
 from quiz.models import Option, Question
 from sops.models import SOPChunk, SOPDocument
 
-from . import adaptive, fsrs
-from .models import AttemptAnswer, ChunkMastery, QuizAttempt, TopicMastery
+from . import adaptive, evaluation, fsrs
+from .models import AttemptAnswer, ChunkMastery, QuizAttempt, QuizAttemptQuestion, TopicMastery
 from .services import QUESTION_K_FACTOR, apply_elo_update
+
+
+def _offer_exactly(attempt_id, question_ids):
+    """Narrow an attempt's persisted offered set to exactly `question_ids`.
+
+    Submission must match the offered set exactly, so a test that models a *targeted*
+    assessment -- the adaptive engine selecting only the weak sections -- needs an attempt
+    whose offered set is that subset. The self-started quiz path offers every approved
+    question for the SOP, so tests covering targeted retraining narrow it here.
+
+    This is test setup standing in for the assignment endpoint, not a bypass: the
+    submission itself still goes through the API and is still validated against whatever
+    set is recorded.
+    """
+    QuizAttemptQuestion.objects.filter(attempt_id=attempt_id).delete()
+    QuizAttemptQuestion.objects.bulk_create(
+        [
+            QuizAttemptQuestion(attempt_id=attempt_id, question_id=qid, position=position)
+            for position, qid in enumerate(question_ids)
+        ]
+    )
 
 
 class QuizAttemptSubmitTests(APITestCase):
@@ -294,6 +317,7 @@ class AdaptiveRetrainingTests(APITestCase):
             {"question": self.questions[1].id, "selected_option": self.correct_options[1].id},
             {"question": self.questions[2].id, "selected_option": self.wrong_options[2].id},
         ]
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
 
         mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
@@ -307,6 +331,7 @@ class AdaptiveRetrainingTests(APITestCase):
             {"question": self.questions[0].id, "selected_option": self.correct_options[0].id},
             {"question": self.questions[1].id, "selected_option": self.wrong_options[1].id},
         ]
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
 
         mastery = TopicMastery.objects.get(learner=self.learner, sop=self.sop)
@@ -340,6 +365,7 @@ class AdaptiveRetrainingTests(APITestCase):
             {"question": easy_qs[1].id, "selected_option": easy_correct[1].id},
             {"question": easy_qs[2].id, "selected_option": easy_wrong[2].id},
         ]
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         response = self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
         self.assertEqual(float(response.data["score"]), 75.0)  # plain score: 3/4 correct
 
@@ -373,6 +399,7 @@ class AdaptiveRetrainingTests(APITestCase):
             {"question": trusted_qs[2].id, "selected_option": trusted_correct[2].id},
             {"question": ambiguous_q.id, "selected_option": ambiguous_wrong.id},
         ]
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         response = self.client.post(f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
         self.assertEqual(float(response.data["score"]), 75.0)  # plain score: 3/4 correct
 
@@ -449,6 +476,9 @@ class AdaptiveRetrainingTests(APITestCase):
             attempt = self.client.post(
                 "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
             ).data["id"]
+            # A single-question assessment, failed three times, to drive the escalation
+            # threshold. Narrowed so the submission matches the recorded offered set.
+            _offer_exactly(attempt, [self.questions[0].id])
             self.client.post(
                 f"/api/attempts/quiz-attempts/{attempt}/submit/",
                 {"answers": [{"question": self.questions[0].id, "selected_option": self.wrong_options[0].id}]},
@@ -512,7 +542,15 @@ class AdaptiveLearningScenarioTests(APITestCase):
         self.client.force_authenticate(user=self.learner)
 
     def _take_quiz(self, outcomes):
-        """outcomes: {"GMP": True, "CAPA": False, ...} -> answer both questions that way."""
+        """outcomes: {"GMP": True, "CAPA": False, ...} -> answer both questions that way.
+
+        Submission must now match the attempt's persisted offered set exactly, so an
+        attempt covering a subset of sections has to be created as a *targeted* attempt --
+        which is what the adaptive assignment endpoint produces when it selects only the
+        weak sections. Naming fewer sections here therefore models targeted retraining,
+        exactly as it did before this contract existed; the offered set is narrowed to the
+        questions being sat rather than the submission being allowed to omit questions.
+        """
         attempt_id = self.client.post(
             "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
         ).data["id"]
@@ -521,6 +559,7 @@ class AdaptiveLearningScenarioTests(APITestCase):
             for i, question in enumerate(self.questions[name]):
                 option = self.correct[name][i] if should_be_correct else self.wrong[name][i]
                 answers.append({"question": question.id, "selected_option": option.id})
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         return self.client.post(
             f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
         )
@@ -695,6 +734,7 @@ class AdaptiveRecencyIntegrationTests(APITestCase):
                 "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
                 format="json",
             ).data["id"]
+            _offer_exactly(attempt_id, [self.question.id])
             self.client.post(
                 f"/api/attempts/quiz-attempts/{attempt_id}/submit/",
                 {"answers": [{"question": self.question.id,
@@ -717,7 +757,14 @@ class AdaptiveRecencyIntegrationTests(APITestCase):
         section = self._section()
         self.assertEqual(section["accuracy"], 50.0)          # lifetime, unchanged
         self.assertEqual(section["recent_accuracy"], 100.0)  # displayed
-        self.assertEqual(section["weighted_accuracy"], 66.7)  # what the decision used
+        # 66.5, not the 66.7 this asserted before difficulty weighting existed. These answers
+        # go through the API, so each one moves the question's Elo; the later answers therefore
+        # carry a slightly different difficulty weight than the earlier ones. The 0.2pp shift is
+        # difficulty weighting acting on a genuinely drifted rating, not a regression.
+        # The property under test is unchanged and asserted below: the deciding figure sits far
+        # above lifetime, so the section is no longer HIGH.
+        self.assertEqual(section["weighted_accuracy"], 66.5)
+        self.assertGreater(section["weighted_accuracy"], section["accuracy"])
         self.assertNotEqual(section["priority"], "high")
 
     def test_learner_who_declined_is_flagged_before_lifetime_would_notice(self):
@@ -726,7 +773,9 @@ class AdaptiveRecencyIntegrationTests(APITestCase):
 
         section = self._section()
         self.assertEqual(section["accuracy"], 50.0)
-        self.assertEqual(section["weighted_accuracy"], 33.3)
+        # 33.2 rather than 33.3, for the same reason as above.
+        self.assertEqual(section["weighted_accuracy"], 33.2)
+        self.assertLess(section["weighted_accuracy"], section["accuracy"])
         self.assertEqual(section["priority"], "high")
 
     def test_reason_names_the_metric_the_decision_was_made_on(self):
@@ -737,10 +786,15 @@ class AdaptiveRecencyIntegrationTests(APITestCase):
         """
         self._answer(correct=True, times=5)
         self._answer(correct=False, times=5)
-        reason = self._section()["reason"]
-        self.assertIn("33.3%", reason)              # the deciding figure
-        self.assertIn("recency-weighted", reason)   # named as such
+        section = self._section()
+        reason = section["reason"]
+        # The reason must quote the figure the decision was actually made on, whatever it is.
+        self.assertIn(f"{section['weighted_accuracy']}%", reason)
+        self.assertIn("recency-", reason)           # named as such
         self.assertIn("50.0% lifetime", reason)     # both shown, no contradiction
+        # Difficulty was recorded for these answers, so the basis must say so.
+        self.assertIn("difficulty-weighted", reason)
+        self.assertTrue(section["difficulty_weighted"])
 
     def test_learning_gain_is_measured_from_real_answers(self):
         self._answer(correct=False, times=4)
@@ -776,6 +830,7 @@ class EvidenceSufficiencyTests(APITestCase):
                 "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
                 format="json",
             ).data["id"]
+            _offer_exactly(attempt_id, [self.question.id])
             self.client.post(
                 f"/api/attempts/quiz-attempts/{attempt_id}/submit/",
                 {"answers": [{"question": self.question.id,
@@ -989,6 +1044,7 @@ class TwoLearnerPersonalisationTests(APITestCase):
             for i, q in enumerate(self.questions[name]):
                 option = (self.right if correct else self.wrong)[name][i]
                 answers.append({"question": q.id, "selected_option": option.id})
+        _offer_exactly(attempt_id, [a["question"] for a in answers])
         self.client.post(
             f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
         )
@@ -1063,6 +1119,10 @@ class SubmissionValidationTests(APITestCase):
         ).data["id"]
 
     def _submit(self, answers):
+        # Deliberately NOT narrowed: this class exists to prove that foreign, unapproved,
+        # duplicated and not-offered questions are rejected. Its attempt's offered set is
+        # the real one the server recorded -- exactly [self.question], since the draft and
+        # the foreign-SOP question are not approved for this SOP and role.
         return self.client.post(
             f"/api/attempts/quiz-attempts/{self.attempt_id}/submit/", {"answers": answers}, format="json"
         )
@@ -1122,11 +1182,21 @@ class SubmissionValidationTests(APITestCase):
                 self.assertEqual(self.question.elo_rating, 1500)
 
     def test_distinct_question_ids_are_still_accepted(self):
-        """The guard rejects repetition, not multi-question submissions."""
+        """The guard rejects repetition, not multi-question submissions.
+
+        The second question is created before the attempt, so both are in the offered set
+        the server records at creation. A question added *after* an attempt starts is
+        deliberately not offered by that attempt -- the assessment is fixed when it begins.
+        """
         second = Question.objects.create(
             sop=self.sop, job_role=self.role, question_text="Q2?", explanation="B.", status="approved",
         )
         second_right = Option.objects.create(question=second, option_text="R", is_correct=True)
+        attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
+            format="json",
+        ).data["id"]
+        self.attempt_id = attempt_id
 
         response = self._submit([
             {"question": self.question.id, "selected_option": self.right.id},
@@ -1135,6 +1205,1204 @@ class SubmissionValidationTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).count(), 2)
+
+
+class OfferedQuestionSetTests(APITestCase):
+    """The attempt, not the browser, defines what the assessment was.
+
+    Before this contract the server checked only that a submitted question belonged to the
+    attempt's SOP, matched the role and was approved. A modified client could therefore
+    substitute a different eligible question, or omit questions it did not want to answer
+    -- and because the score was computed over submitted answers, omitting inflated it.
+    These tests pin the exact-set contract and the zero-write guarantee behind it.
+    """
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.other_learner = get_user_model().objects.create_user(username="priya", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-970", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.other_sop = SOPDocument.objects.create(
+            title="Other", sop_code="SOP-971", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="Section text", section_title="Section 1",
+            chunking_strategy="heading",
+        )
+        self.questions, self.right, self.wrong = [], [], []
+        for i in range(3):
+            q = Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"Q{i}?", explanation="B.",
+                status="approved", source_chunk=self.chunk,
+            )
+            self.questions.append(q)
+            self.right.append(Option.objects.create(question=q, option_text="R", is_correct=True))
+            self.wrong.append(Option.objects.create(question=q, option_text="W", is_correct=False))
+        self.foreign = Question.objects.create(
+            sop=self.other_sop, job_role=self.role, question_text="F?", explanation="B.",
+            status="approved",
+        )
+        Option.objects.create(question=self.foreign, option_text="R", is_correct=True)
+        self.client.force_authenticate(user=self.learner)
+        self.attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
+            format="json",
+        ).data["id"]
+
+    def _submit(self, answers):
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{self.attempt_id}/submit/", {"answers": answers},
+            format="json",
+        )
+
+    def _full(self, correct=(True, True, True)):
+        return [
+            {"question": self.questions[i].id,
+             "selected_option": (self.right[i] if ok else self.wrong[i]).id}
+            for i, ok in enumerate(correct)
+        ]
+
+    def _assert_nothing_written(self):
+        """A1x: a rejected submission must leave every derived record untouched."""
+        self.assertFalse(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).exists())
+        self.assertFalse(TopicMastery.objects.filter(learner=self.learner).exists())
+        self.assertFalse(ChunkMastery.objects.filter(learner=self.learner).exists())
+        self.assertIsNone(QuizAttempt.objects.get(id=self.attempt_id).completed_at)
+        for q in self.questions:
+            q.refresh_from_db()
+            self.assertEqual(q.elo_rating, 1500)
+
+    # ---- A1 / A18 -------------------------------------------------------------
+    def test_a1_offered_set_is_persisted_when_an_attempt_is_created(self):
+        offered = QuizAttemptQuestion.objects.filter(attempt_id=self.attempt_id)
+        self.assertEqual(offered.count(), 3)
+        self.assertEqual(
+            sorted(offered.values_list("question_id", flat=True)),
+            sorted(q.id for q in self.questions),
+        )
+        self.assertEqual(list(offered.values_list("position", flat=True)), [0, 1, 2])
+
+    def test_a18_adaptive_selection_is_persisted_exactly_as_served(self):
+        """The auto-assigned attempt's offered set must equal the ids reported to the client."""
+        TopicMastery.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+            next_eligible_at=timezone.now() - datetime.timedelta(days=1),
+        )
+        response = self.client.get("/api/attempts/auto-assigned/")
+        assignment = response.data["assignments"][0]
+        persisted = list(
+            QuizAttemptQuestion.objects.filter(attempt_id=assignment["attempt_id"])
+            .values_list("question_id", flat=True)
+        )
+        self.assertEqual(sorted(persisted), sorted(assignment["question_ids"]))
+
+    def test_a18b_reused_attempt_keeps_its_original_offered_set(self):
+        """Re-polling the assignment endpoint must not silently re-scope a live attempt."""
+        TopicMastery.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+            next_eligible_at=timezone.now() - datetime.timedelta(days=1),
+        )
+        first = self.client.get("/api/attempts/auto-assigned/").data["assignments"][0]
+        second = self.client.get("/api/attempts/auto-assigned/").data["assignments"][0]
+        self.assertEqual(first["attempt_id"], second["attempt_id"])
+        self.assertEqual(sorted(first["question_ids"]), sorted(second["question_ids"]))
+
+    # ---- A2 / A9 / A10 --------------------------------------------------------
+    def test_a2_exact_offered_set_is_accepted(self):
+        response = self._submit(self._full())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(float(response.data["score"]), 100.0)
+
+    def test_a9_unanswered_offered_question_sent_as_null_is_accepted(self):
+        answers = self._full()
+        answers[2]["selected_option"] = None
+        response = self._submit(answers)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).count(), 3)
+
+    def test_a10_score_denominator_is_the_full_offered_set(self):
+        """2 correct, 1 unanswered over 3 offered must be 66.67% -- never 2/2 = 100%."""
+        answers = self._full()
+        answers[2]["selected_option"] = None
+        response = self._submit(answers)
+        self.assertAlmostEqual(float(response.data["score"]), 66.67, places=1)
+
+    # ---- A3–A8: the rejection matrix ------------------------------------------
+    def test_a3_duplicate_ids_rejected(self):
+        answers = self._full()
+        answers[1] = dict(answers[0])
+        response = self._submit(answers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(self.questions[0].id, response.data["duplicate_question_ids"])
+        self._assert_nothing_written()
+
+    def test_a4_a5_foreign_question_rejected(self):
+        answers = self._full()
+        answers[2] = {"question": self.foreign.id, "selected_option": None}
+        response = self._submit(answers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(self.foreign.id, response.data["not_offered_question_ids"])
+        self._assert_nothing_written()
+
+    def test_a6_a8_missing_offered_question_rejected(self):
+        """The partial-submission inflation vector: answer only what you know."""
+        response = self._submit(self._full()[:2])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(self.questions[2].id, response.data["missing_question_ids"])
+        self.assertEqual(response.data["offered_count"], 3)
+        self.assertEqual(response.data["submitted_count"], 2)
+        self._assert_nothing_written()
+
+    def test_a7_extra_question_rejected(self):
+        extra = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Extra?", explanation="B.",
+            status="approved",
+        )
+        Option.objects.create(question=extra, option_text="R", is_correct=True)
+        response = self._submit(self._full() + [{"question": extra.id, "selected_option": None}])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(extra.id, response.data["not_offered_question_ids"])
+        self._assert_nothing_written()
+
+    def test_a8b_empty_submission_rejected_when_questions_were_offered(self):
+        response = self._submit([])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self._assert_nothing_written()
+
+    def test_adversarial_mixed_payload_rejected_with_zero_writes(self):
+        """The full hostile payload: offered + not-offered + foreign + repeats."""
+        response = self._submit([
+            {"question": self.questions[0].id, "selected_option": self.right[0].id},
+            {"question": self.foreign.id, "selected_option": None},
+            {"question": self.questions[0].id, "selected_option": self.right[0].id},
+            {"question": self.questions[0].id, "selected_option": self.right[0].id},
+        ])
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self._assert_nothing_written()
+
+    # ---- A16 / A17 ------------------------------------------------------------
+    def test_a16_completed_attempt_cannot_be_resubmitted(self):
+        self.assertEqual(self._submit(self._full()).status_code, status.HTTP_200_OK)
+        self.assertEqual(self._submit(self._full()).status_code, status.HTTP_409_CONFLICT)
+
+    def test_a17_another_learner_cannot_submit_against_this_attempt(self):
+        self.client.force_authenticate(user=self.other_learner)
+        response = self._submit(self._full())
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(AttemptAnswer.objects.filter(attempt_id=self.attempt_id).exists())
+
+
+class InteractionTelemetryTests(APITestCase):
+    """B1-B10: the interaction record must be temporally usable and server-authoritative.
+
+    These fields exist so that future knowledge-tracing work has a valid event log. They
+    are pinned here because the guarantees -- server-set time, untrusted latency, no
+    fabricated history -- are exactly what makes such a dataset defensible.
+    """
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-972", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.q1 = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q1?", explanation="B.", status="approved",
+        )
+        self.r1 = Option.objects.create(question=self.q1, option_text="R", is_correct=True)
+        self.q2 = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q2?", explanation="B.", status="approved",
+        )
+        self.r2 = Option.objects.create(question=self.q2, option_text="R", is_correct=True)
+        self.client.force_authenticate(user=self.learner)
+
+    def _attempt(self):
+        return self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
+            format="json",
+        ).data["id"]
+
+    def _submit(self, answers, attempt_id=None):
+        attempt_id = attempt_id or self._attempt()
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
+        )
+
+    def _both(self, **extra):
+        return [
+            dict({"question": self.q1.id, "selected_option": self.r1.id}, **extra),
+            dict({"question": self.q2.id, "selected_option": self.r2.id}, **extra),
+        ]
+
+    def test_b1_b2_answered_at_is_set_server_side_and_timezone_aware(self):
+        before = timezone.now()
+        self.assertEqual(self._submit(self._both()).status_code, status.HTTP_200_OK)
+        after = timezone.now()
+        for answer in AttemptAnswer.objects.all():
+            self.assertIsNotNone(answer.answered_at)
+            self.assertIsNotNone(answer.answered_at.tzinfo)  # B2: aware, not naive
+            self.assertTrue(before <= answer.answered_at <= after)
+
+    def test_b3_client_cannot_override_answered_at(self):
+        forged = timezone.now() - datetime.timedelta(days=365)
+        self._submit(self._both(answered_at=forged.isoformat()))
+        for answer in AttemptAnswer.objects.all():
+            self.assertGreater(answer.answered_at, forged + datetime.timedelta(days=300))
+
+    def test_b4_b7_latency_accepted_and_optional(self):
+        answers = self._both()
+        answers[0]["response_latency_ms"] = 4200
+        # answers[1] omits it entirely -- B7: latency may be null
+        self.assertEqual(self._submit(answers).status_code, status.HTTP_200_OK)
+        self.assertEqual(AttemptAnswer.objects.get(question=self.q1).response_latency_ms, 4200)
+        self.assertIsNone(AttemptAnswer.objects.get(question=self.q2).response_latency_ms)
+
+    def test_b5_negative_latency_rejected_with_no_writes(self):
+        answers = self._both()
+        answers[0]["response_latency_ms"] = -1
+        response = self._submit(answers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(AttemptAnswer.objects.count(), 0)
+
+    def test_b6_implausible_latency_rejected(self):
+        answers = self._both()
+        answers[0]["response_latency_ms"] = AttemptAnswer.MAX_RESPONSE_LATENCY_MS + 1
+        response = self._submit(answers)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(AttemptAnswer.objects.count(), 0)
+
+    def test_b6b_non_numeric_latency_rejected(self):
+        answers = self._both()
+        answers[0]["response_latency_ms"] = "soon"
+        self.assertEqual(self._submit(answers).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(AttemptAnswer.objects.count(), 0)
+
+    def test_b8_pre_existing_answers_are_not_given_fabricated_timestamps(self):
+        """A row written outside the submission path keeps a NULL answered_at.
+
+        Stands in for the historical rows that predate this field: the migration must not
+        invent a response time for them, and nothing may backfill one later.
+        """
+        attempt = QuizAttempt.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+        )
+        legacy = AttemptAnswer.objects.create(attempt=attempt, question=self.q1, is_correct=True)
+        legacy.refresh_from_db()
+        self.assertIsNone(legacy.answered_at)
+        self.assertIsNone(legacy.response_latency_ms)
+
+    def test_b9_b10_interactions_are_orderable_and_temporally_distinguishable(self):
+        """A KT sequence must be reconstructable by time, across attempts."""
+        self._submit(self._both())
+        first_batch = list(AttemptAnswer.objects.values_list("answered_at", flat=True))
+        self._submit(self._both())
+        ordered = list(
+            AttemptAnswer.objects.order_by("answered_at", "id").values_list("answered_at", flat=True)
+        )
+        self.assertEqual(len(ordered), 4)
+        self.assertEqual(ordered, sorted(ordered))
+        # B10: the second sitting is distinguishable from the first
+        self.assertGreater(max(ordered), max(first_batch))
+
+    def test_kt_sequence_can_be_reconstructed_with_concept_and_correctness(self):
+        """The shape future KT work consumes: (time, question, concept, correct)."""
+        chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="t", section_title="S1", chunking_strategy="heading",
+        )
+        self.q1.source_chunk = chunk
+        self.q1.save(update_fields=["source_chunk"])
+        self._submit(self._both())
+        sequence = [
+            (a.answered_at, a.question_id, a.question.source_chunk_id, a.is_correct)
+            for a in AttemptAnswer.objects.select_related("question").order_by("answered_at", "id")
+        ]
+        self.assertEqual(len(sequence), 2)
+        self.assertTrue(all(t is not None for t, _q, _c, _ok in sequence))
+        self.assertEqual(sequence[0][2], chunk.id)
+
+
+class EloSnapshotTests(APITestCase):
+    """The interaction record must state the ratings that were true when it happened.
+
+    Question.elo_rating and TopicMastery.elo_rating both move after every answer, and they
+    move partly *because of* the answer being recorded. Reconstructing a past interaction
+    from today's ratings would therefore feed the outcome back into its own feature -- the
+    definition of look-ahead bias. These tests pin the snapshot to the pre-update values
+    and prove it survives later drift.
+
+    Instrumentation only: no test here asserts any change to adaptive behaviour, because
+    there is none.
+    """
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom Entry", sop_code="SOP-980", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="Section text", section_title="Section 1",
+            chunking_strategy="heading",
+        )
+        self.question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q?", explanation="B.",
+            status="approved", source_chunk=self.chunk,
+        )
+        self.right = Option.objects.create(question=self.question, option_text="R", is_correct=True)
+        self.wrong = Option.objects.create(question=self.question, option_text="W", is_correct=False)
+        self.client.force_authenticate(user=self.learner)
+
+    def _attempt(self):
+        return self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
+            format="json",
+        ).data["id"]
+
+    def _submit(self, correct=True, extra=None, attempt_id=None):
+        answer = {
+            "question": self.question.id,
+            "selected_option": (self.right if correct else self.wrong).id,
+        }
+        if extra:
+            answer.update(extra)
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id or self._attempt()}/submit/",
+            {"answers": [answer]}, format="json",
+        )
+
+    # ---- TEST 1 / TEST 2 -------------------------------------------------------
+    def test_1_question_difficulty_snapshot_is_the_pre_answer_rating(self):
+        difficulty_before = self.question.elo_rating
+        self.assertEqual(difficulty_before, 1500)
+
+        self.assertEqual(self._submit().status_code, status.HTTP_200_OK)
+
+        answer = AttemptAnswer.objects.get()
+        self.assertEqual(answer.question_difficulty_at_answer, difficulty_before)
+
+    def test_2_learner_ability_snapshot_is_the_pre_answer_rating(self):
+        """No TopicMastery exists yet on a first attempt, so the rating truthfully is the
+        starting value -- not a fabricated one."""
+        self.assertFalse(TopicMastery.objects.filter(learner=self.learner).exists())
+
+        self._submit()
+
+        answer = AttemptAnswer.objects.get()
+        self.assertEqual(answer.learner_ability_at_answer, 1500)
+
+    def test_2b_second_attempt_snapshots_the_carried_forward_ability(self):
+        """The snapshot must track the learner's real ability, not always 1500."""
+        self._submit(correct=True)
+        ability_after_first = TopicMastery.objects.get(learner=self.learner).elo_rating
+        self.assertNotEqual(ability_after_first, 1500)
+
+        self._submit(correct=True)
+
+        latest = AttemptAnswer.objects.order_by("-id").first()
+        self.assertAlmostEqual(latest.learner_ability_at_answer, ability_after_first, places=6)
+
+    # ---- TEST 3: immutability under later drift --------------------------------
+    def test_3_snapshot_is_unaffected_by_subsequent_elo_movement(self):
+        self._submit(correct=True)
+        answer = AttemptAnswer.objects.get()
+        snapshot_difficulty = answer.question_difficulty_at_answer
+        snapshot_ability = answer.learner_ability_at_answer
+
+        self.question.refresh_from_db()
+        mastery = TopicMastery.objects.get(learner=self.learner)
+        # The ratings really did move as a result of that answer...
+        self.assertLess(self.question.elo_rating, snapshot_difficulty)
+        self.assertGreater(mastery.elo_rating, snapshot_ability)
+
+        # ...and several further answers move them further still. Asserted as continued
+        # drift rather than against a hard-coded rating, so the test states the property
+        # being protected instead of an arithmetic result that would need revisiting if a
+        # K-factor ever changed.
+        drift_after_one = self.question.elo_rating
+        for _ in range(3):
+            self._submit(correct=True)
+        self.question.refresh_from_db()
+        self.assertLess(self.question.elo_rating, drift_after_one)
+
+        # The original record is unchanged.
+        answer.refresh_from_db()
+        self.assertEqual(answer.question_difficulty_at_answer, snapshot_difficulty)
+        self.assertEqual(answer.learner_ability_at_answer, snapshot_ability)
+        self.assertEqual(snapshot_difficulty, 1500)
+        self.assertEqual(snapshot_ability, 1500)
+
+    # ---- TEST 4: no fabricated history -----------------------------------------
+    def test_4_rows_written_outside_the_submission_path_stay_null(self):
+        """Stands in for the rows that predate this field. The migration adds no default
+        and nothing backfills them; NULL means 'not measurable', not zero."""
+        attempt = QuizAttempt.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role,
+        )
+        legacy = AttemptAnswer.objects.create(
+            attempt=attempt, question=self.question, is_correct=True,
+        )
+        legacy.refresh_from_db()
+        self.assertIsNone(legacy.question_difficulty_at_answer)
+        self.assertIsNone(legacy.learner_ability_at_answer)
+
+    # ---- TEST 5: client cannot forge -------------------------------------------
+    def test_5_client_supplied_snapshot_values_are_ignored(self):
+        self._submit(extra={
+            "question_difficulty_at_answer": 9999.0,
+            "learner_ability_at_answer": -9999.0,
+        })
+        answer = AttemptAnswer.objects.get()
+        self.assertEqual(answer.question_difficulty_at_answer, 1500)
+        self.assertEqual(answer.learner_ability_at_answer, 1500)
+
+    # ---- TEST 6: KT tuple reconstruction ---------------------------------------
+    def test_6_kt_interaction_tuple_is_historically_correct(self):
+        """(timestamp, question, concept, difficulty, ability, correctness) -- and the
+        difficulty must be the historical one, not the current live rating."""
+        self._submit(correct=False)
+
+        answer = AttemptAnswer.objects.select_related("question").get()
+        tuple_ = (
+            answer.answered_at,
+            answer.question_id,
+            answer.question.source_chunk_id,
+            answer.question_difficulty_at_answer,
+            answer.learner_ability_at_answer,
+            answer.is_correct,
+        )
+        self.assertIsNotNone(tuple_[0])
+        self.assertEqual(tuple_[2], self.chunk.id)
+        self.assertEqual(tuple_[3], 1500)
+        self.assertEqual(tuple_[4], 1500)
+        self.assertFalse(tuple_[5])
+
+        # A wrong answer raises the question's live rating; the record must not follow it.
+        self.question.refresh_from_db()
+        self.assertGreater(self.question.elo_rating, tuple_[3])
+
+    # ---- TEST 7: rejected submissions write nothing -----------------------------
+    def test_7_invalid_submissions_create_no_snapshots(self):
+        foreign_sop = SOPDocument.objects.create(
+            title="Other", sop_code="SOP-981", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        foreign = Question.objects.create(
+            sop=foreign_sop, job_role=self.role, question_text="F?", explanation="B.",
+            status="approved",
+        )
+        attempt_id = self._attempt()
+
+        for label, answers in (
+            ("not offered", [{"question": foreign.id, "selected_option": None}]),
+            ("duplicate", [
+                {"question": self.question.id, "selected_option": self.right.id},
+                {"question": self.question.id, "selected_option": self.right.id},
+            ]),
+            ("empty", []),
+        ):
+            with self.subTest(label=label):
+                response = self.client.post(
+                    f"/api/attempts/quiz-attempts/{attempt_id}/submit/",
+                    {"answers": answers}, format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(AttemptAnswer.objects.count(), 0)
+                self.question.refresh_from_db()
+                self.assertEqual(self.question.elo_rating, 1500)
+                self.assertFalse(TopicMastery.objects.filter(learner=self.learner).exists())
+
+
+class DifficultyAwarePriorityTests(TestCase):
+    """Question difficulty now weights the accuracy that drives priority, not only the pass
+    signal that drives mastery.
+
+    Before this change an easy question missed and a hard question missed contributed
+    identically to whether a section was called weak. Elo already weighted the pass signal, so
+    the two halves of the system disagreed about what "hard" meant.
+
+    Weighting uses the difficulty *recorded with each answer*, never the question's live rating:
+    a live rating moves whenever any learner answers, which would make a section's past accuracy
+    drift on its own and a past decision impossible to reproduce.
+    """
+
+    EASY = 1200.0   # DIFFICULTY_SEED_ELO["easy"]  -> weight 1.0
+    HARD = 1800.0   # DIFFICULTY_SEED_ELO["hard"]  -> weight 2.0
+
+    # ---- weight mapping ---------------------------------------------------------
+    def test_difficulty_weight_spans_one_to_two_and_clamps(self):
+        self.assertAlmostEqual(adaptive.difficulty_weight(self.EASY), 1.0)
+        self.assertAlmostEqual(adaptive.difficulty_weight(self.HARD), 2.0)
+        self.assertAlmostEqual(adaptive.difficulty_weight(1500.0), 1.5)
+        # a single outlier rating must not dominate the metric
+        self.assertAlmostEqual(adaptive.difficulty_weight(50.0), 1.0)
+        self.assertAlmostEqual(adaptive.difficulty_weight(9000.0), 2.0)
+
+    def test_missing_difficulty_is_neutral(self):
+        self.assertAlmostEqual(adaptive.difficulty_weight(None), 1.0)
+
+    # ---- 1 / 2: easy vs hard, miss and success ----------------------------------
+    def test_1_hard_miss_hurts_more_than_easy_miss(self):
+        """Same answers, same order -- only which question was missed differs."""
+        missed_hard = adaptive.weighted_accuracy(
+            [False, True, True], [self.HARD, self.EASY, self.EASY])
+        missed_easy = adaptive.weighted_accuracy(
+            [False, True, True], [self.EASY, self.HARD, self.HARD])
+        self.assertLess(missed_hard, missed_easy)
+
+    def test_2_hard_success_helps_more_than_easy_success(self):
+        got_hard_right = adaptive.weighted_accuracy(
+            [True, False, False], [self.HARD, self.EASY, self.EASY])
+        got_easy_right = adaptive.weighted_accuracy(
+            [True, False, False], [self.EASY, self.HARD, self.HARD])
+        self.assertGreater(got_hard_right, got_easy_right)
+
+    def test_difficulty_can_change_the_priority_band(self):
+        """The point of the feature: failing only the hard items is not the same as failing
+        everything, and the classification must be able to reflect that."""
+        # Three answers, two correct. Wrong one is HARD -> weighted accuracy drops below 60.
+        wrong_was_hard = adaptive.weighted_accuracy(
+            [False, True, True], [self.HARD, self.EASY, self.EASY])
+        # Same pattern, wrong one is EASY -> stays above 60.
+        wrong_was_easy = adaptive.weighted_accuracy(
+            [False, True, True], [self.EASY, self.HARD, self.HARD])
+        band_hard, _ = adaptive._classify(3, 2, 66.7, wrong_was_hard, None, difficulty_weighted=True)
+        band_easy, _ = adaptive._classify(3, 2, 66.7, wrong_was_easy, None, difficulty_weighted=True)
+        self.assertEqual(band_hard, adaptive.PRIORITY_HIGH)
+        self.assertEqual(band_easy, adaptive.PRIORITY_MEDIUM)
+
+    # ---- 3 / 4 / 5: the guarantees that must NOT change -------------------------
+    def test_3_genuinely_weak_section_stays_high_whatever_the_difficulty(self):
+        for difficulty in (self.EASY, 1500.0, self.HARD):
+            with self.subTest(difficulty=difficulty):
+                weighted = adaptive.weighted_accuracy([False] * 5, [difficulty] * 5)
+                self.assertEqual(weighted, 0.0)
+                band, _ = adaptive._classify(5, 0, 0.0, weighted, None, difficulty_weighted=True)
+                self.assertEqual(band, adaptive.PRIORITY_HIGH)
+
+    def test_4_strong_section_is_never_promoted_to_high_by_difficulty(self):
+        for difficulty in (self.EASY, 1500.0, self.HARD):
+            with self.subTest(difficulty=difficulty):
+                weighted = adaptive.weighted_accuracy([True] * 5, [difficulty] * 5)
+                self.assertEqual(weighted, 100.0)
+                band, _ = adaptive._classify(5, 5, 100.0, weighted, None, difficulty_weighted=True)
+                self.assertEqual(band, adaptive.PRIORITY_LOW)
+
+    def test_5_min_evidence_gate_is_unchanged(self):
+        """One hard success must still not be enough to exclude a section."""
+        weighted = adaptive.weighted_accuracy([True], [self.HARD])
+        band, reason = adaptive._classify(1, 1, 100.0, weighted, None, difficulty_weighted=True)
+        self.assertEqual(band, adaptive.PRIORITY_MEDIUM)
+        self.assertIn("insufficient evidence", reason)
+
+    # ---- 6 / 7 / 8: existing behaviour preserved --------------------------------
+    def test_6_recency_weighting_still_applies(self):
+        """With difficulty held constant the figures must match the pre-change values exactly."""
+        improving = [True] * 5 + [False] * 5      # newest-first: 5 recent correct
+        declining = [False] * 5 + [True] * 5
+        flat = [1500.0] * 10
+        self.assertEqual(adaptive.weighted_accuracy(improving, flat), 66.7)
+        self.assertEqual(adaptive.weighted_accuracy(declining, flat), 33.3)
+        # and identical to omitting difficulty entirely
+        self.assertEqual(adaptive.weighted_accuracy(improving), 66.7)
+
+    def test_7_mastery_retirement_still_short_circuits(self):
+        class _Mastery:
+            mastery_status = "mastered"
+            streak_correct = 3
+        weighted = adaptive.weighted_accuracy([False] * 3, [self.HARD] * 3)
+        band, _ = adaptive._classify(3, 0, 0.0, weighted, _Mastery(), difficulty_weighted=True)
+        self.assertEqual(band, adaptive.PRIORITY_NONE)
+
+    def test_8_never_assessed_still_high(self):
+        band, reason = adaptive._classify(0, 0, None, None, None, difficulty_weighted=False)
+        self.assertEqual(band, adaptive.PRIORITY_HIGH)
+        self.assertIn("Never assessed", reason)
+
+    # ---- backwards compatibility -------------------------------------------------
+    def test_history_without_snapshots_behaves_exactly_as_before(self):
+        """Pre-instrumentation answers must not silently change meaning."""
+        sequence = [True, False, True, True, False]
+        self.assertEqual(
+            adaptive.weighted_accuracy(sequence, [None] * 5),
+            adaptive.weighted_accuracy(sequence),
+        )
+
+    def test_mixed_recorded_and_missing_difficulty_is_handled(self):
+        value = adaptive.weighted_accuracy(
+            [True, False, True], [self.HARD, None, self.EASY])
+        self.assertIsNotNone(value)
+        self.assertGreaterEqual(value, 0.0)
+        self.assertLessEqual(value, 100.0)
+
+    # ---- 10: explainability -------------------------------------------------------
+    def test_10_reason_names_difficulty_only_when_it_was_used(self):
+        weighted = adaptive.weighted_accuracy([False, True, True], [self.HARD, self.EASY, self.EASY])
+        _band, with_difficulty = adaptive._classify(
+            3, 2, 66.7, weighted, None, difficulty_weighted=True)
+        _band2, without = adaptive._classify(
+            3, 2, 66.7, weighted, None, difficulty_weighted=False)
+        self.assertIn("recency- and difficulty-weighted", with_difficulty)
+        self.assertNotIn("difficulty", without)
+
+
+class DifficultyAwarePriorityIntegrationTests(APITestCase):
+    """End to end: a real submission records difficulty, and the learning path reflects it."""
+
+    def setUp(self):
+        from accounts.models import LearnerProfile
+
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        LearnerProfile.objects.create(user=self.learner, job_role=self.role, employee_code="E1")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom", sop_code="SOP-995", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="A", section_title="Section 1", chunking_strategy="heading")
+        self.questions, self.right, self.wrong = [], [], []
+        for i, difficulty in enumerate(("hard", "easy", "easy")):
+            q = Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"Q{i}?", explanation="B.",
+                status="approved", source_chunk=self.chunk, difficulty=difficulty,
+                elo_rating=Question.DIFFICULTY_SEED_ELO[difficulty],
+            )
+            self.questions.append(q)
+            self.right.append(Option.objects.create(question=q, option_text="R", is_correct=True))
+            self.wrong.append(Option.objects.create(question=q, option_text="W", is_correct=False))
+        self.client.force_authenticate(user=self.learner)
+
+    def _sit(self, outcomes):
+        attempt_id = self.client.post(
+            "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id},
+            format="json",
+        ).data["id"]
+        answers = [
+            {"question": q.id,
+             "selected_option": (self.right[i] if ok else self.wrong[i]).id}
+            for i, (q, ok) in enumerate(zip(self.questions, outcomes))
+        ]
+        return self.client.post(
+            f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json")
+
+    def test_11_learning_path_reports_the_difficulty_basis(self):
+        self.assertEqual(self._sit([False, True, True]).status_code, status.HTTP_200_OK)
+
+        response = self.client.get("/api/attempts/learning-path/")
+        section = next(
+            s for row in response.data["sops"] if row["sop_id"] == self.sop.id
+            for s in row["sections"] if s["chunk_id"] == self.chunk.id
+        )
+        self.assertTrue(section["difficulty_weighted"])
+        self.assertIsNotNone(section["mean_difficulty"])
+        self.assertIn("difficulty-weighted", section["reason"])
+
+    def test_11b_selection_matches_the_engine_decision(self):
+        """The learning path and the adaptive engine must not disagree."""
+        self._sit([False, False, False])
+        response = self.client.get("/api/attempts/learning-path/")
+        row = next(r for r in response.data["sops"] if r["sop_id"] == self.sop.id)
+        section = next(s for s in row["sections"] if s["chunk_id"] == self.chunk.id)
+        self.assertEqual(section["priority"], adaptive.PRIORITY_HIGH)
+        self.assertTrue(section["selected_for_retraining"])
+
+    def test_9_questions_without_a_source_chunk_still_bucket_correctly(self):
+        unlinked = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="U?", explanation="B.",
+            status="approved", source_chunk=None,
+        )
+        Option.objects.create(question=unlinked, option_text="R", is_correct=True)
+        sections = adaptive.analyse_sections(self.learner, self.sop, self.role)
+        unlinked_bucket = [s for s in sections if s["chunk_id"] is None]
+        self.assertEqual(len(unlinked_bucket), 1)
+        self.assertFalse(unlinked_bucket[0]["difficulty_weighted"])
+
+
+class DemoScenarioDifficultyTests(TestCase):
+    """The demonstration fixture must actually exercise difficulty weighting.
+
+    Difficulty was never uniform in the demo -- questions are seeded 1300/1500/1700 from their
+    labels. What made the weighting invisible was uniform *correctness*: every section was
+    answered 3/3 or 0/3, and at 0% or 100% a weighted average equals an unweighted one no
+    matter what the weights are.
+
+    The scenario therefore answers each weak section 1 of 3, getting the hardest question right
+    in one and the easiest in the other. Identical lifetime accuracy, genuinely different
+    evidence. Nothing here sets a priority or a score; the production algorithm decides.
+    """
+
+    def setUp(self):
+        self.role = JobRole.objects.create(name="Operator", department="P")
+        self.sop = SOPDocument.objects.create(
+            title="S", sop_code="SOP-997", version="v1", department="P",
+            file="f.txt", status="processed")
+        self.chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="A", section_title="S1", chunking_strategy="heading")
+
+    def _question(self, difficulty):
+        return Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text=f"{difficulty}?", explanation="B.",
+            status="approved", source_chunk=self.chunk, difficulty=difficulty,
+        )
+
+    # ---- 1 / 3: the fixture really is mixed -------------------------------------
+    def test_1_3_difficulty_labels_seed_distinct_ratings(self):
+        """Elo is seeded from the label on creation, so a mixed section has real spread."""
+        ratings = {d: self._question(d).elo_rating for d in ("easy", "medium", "hard")}
+        self.assertEqual(ratings["easy"], Question.DIFFICULTY_SEED_ELO["easy"])
+        self.assertEqual(ratings["medium"], Question.DIFFICULTY_SEED_ELO["medium"])
+        self.assertEqual(ratings["hard"], Question.DIFFICULTY_SEED_ELO["hard"])
+        self.assertEqual(len(set(ratings.values())), 3)
+
+    # ---- 5: the demonstration property ------------------------------------------
+    def test_5_hardest_right_beats_easiest_right_at_equal_lifetime(self):
+        """The exact claim the demo makes on screen.
+
+        Same three questions, same one-correct-of-three, mirrored: identical lifetime
+        accuracy, different difficulty-weighted evidence.
+        """
+        easy, medium, hard = (Question.DIFFICULTY_SEED_ELO[d] for d in ("easy", "medium", "hard"))
+        difficulties = [medium, easy, hard]          # newest-first, same order for both
+
+        hardest_right = adaptive.weighted_accuracy([False, False, True], difficulties)
+        easiest_right = adaptive.weighted_accuracy([False, True, False], difficulties)
+
+        # identical lifetime accuracy
+        self.assertEqual(adaptive._plain_accuracy([False, False, True]),
+                         adaptive._plain_accuracy([False, True, False]))
+        # but different evidence, and getting the hard one right is worth more
+        self.assertNotEqual(hardest_right, easiest_right)
+        self.assertGreater(hardest_right, easiest_right)
+
+    def test_4_weighted_accuracy_diverges_from_lifetime_when_difficulty_varies(self):
+        easy, medium, hard = (Question.DIFFICULTY_SEED_ELO[d] for d in ("easy", "medium", "hard"))
+        weighted = adaptive.weighted_accuracy([False, False, True], [medium, easy, hard])
+        lifetime = adaptive._plain_accuracy([False, False, True])
+        self.assertNotEqual(weighted, lifetime)
+
+    def test_uniform_difficulty_cannot_change_the_score(self):
+        """Why the old demo showed nothing: uniform weights cancel in a weighted average."""
+        for uniform in (1300.0, 1500.0, 1700.0):
+            with self.subTest(uniform=uniform):
+                self.assertEqual(
+                    adaptive.weighted_accuracy([False, True, False], [uniform] * 3),
+                    adaptive.weighted_accuracy([False, True, False]),
+                )
+
+    def test_uniform_correctness_cannot_change_the_score_either(self):
+        """The actual root cause: at 0% or 100% the weights are irrelevant."""
+        easy, medium, hard = (Question.DIFFICULTY_SEED_ELO[d] for d in ("easy", "medium", "hard"))
+        self.assertEqual(adaptive.weighted_accuracy([False] * 3, [easy, medium, hard]), 0.0)
+        self.assertEqual(adaptive.weighted_accuracy([True] * 3, [easy, medium, hard]), 100.0)
+
+    # ---- 6 / 7: the algorithm still decides, and explains itself -----------------
+    def test_6_priority_still_comes_from_the_existing_rules(self):
+        easy, medium, hard = (Question.DIFFICULTY_SEED_ELO[d] for d in ("easy", "medium", "hard"))
+        weighted = adaptive.weighted_accuracy([False, False, True], [medium, easy, hard])
+        priority, _reason = adaptive._classify(3, 1, 33.3, weighted, None, difficulty_weighted=True)
+        # 1 of 3 is weak on any weighting -- the rule, not the fixture, produces this
+        self.assertEqual(priority, adaptive.PRIORITY_HIGH)
+
+    def test_7_reason_quotes_the_actual_weighted_figure(self):
+        easy, medium, hard = (Question.DIFFICULTY_SEED_ELO[d] for d in ("easy", "medium", "hard"))
+        weighted = adaptive.weighted_accuracy([False, False, True], [medium, easy, hard])
+        _priority, reason = adaptive._classify(3, 1, 33.3, weighted, None, difficulty_weighted=True)
+        self.assertIn(f"{weighted}%", reason)
+        self.assertIn("33.3% lifetime", reason)
+        self.assertIn("recency- and difficulty-weighted", reason)
+
+    # ---- the demo's scenario resolver -------------------------------------------
+    def test_scenario_resolver_supports_both_shapes(self):
+        from attempts.management.commands.demo_adaptive import ALL_DIFFICULTIES, Command
+
+        hard_q, easy_q = self._question("hard"), self._question("easy")
+        resolve = Command._answers_correctly
+
+        # legacy set-of-titles form, still used by the retraining rounds
+        self.assertTrue(resolve("S1", hard_q, {"S1"}))
+        self.assertFalse(resolve("S1", hard_q, {"other"}))
+        # ALL_DIFFICULTIES sentinel
+        self.assertTrue(resolve("S1", hard_q, {"S1": ALL_DIFFICULTIES}))
+        # explicit question ids -- chosen by rating, so LLM labels cannot break the scenario
+        self.assertTrue(resolve("S1", hard_q, {"S1": {hard_q.id}}))
+        self.assertFalse(resolve("S1", easy_q, {"S1": {hard_q.id}}))
+        # a section absent from the mapping is answered incorrectly throughout
+        self.assertFalse(resolve("missing", hard_q, {"S1": {hard_q.id}}))
+
+
+class SyntheticDataSeparationTests(TestCase):
+    """Demo interactions must be identifiable and excluded from evaluation.
+
+    They demonstrate the adaptive loop correctly, but their outcomes are decided by a script
+    rather than observed, so treating them as evidence about learning would be the single
+    easiest way to produce a meaningless result.
+    """
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.role = JobRole.objects.create(name="Operator", department="P")
+        self.sop = SOPDocument.objects.create(
+            title="S", sop_code="SOP-996", version="v1", department="P",
+            file="f.txt", status="processed")
+        self.chunk = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="A", section_title="S1", chunking_strategy="heading")
+        self.question = Question.objects.create(
+            sop=self.sop, job_role=self.role, question_text="Q?", explanation="B.",
+            status="approved", source_chunk=self.chunk)
+
+    def _attempt(self, synthetic, count=6):
+        attempt = QuizAttempt.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role, is_synthetic=synthetic)
+        for i in range(count):
+            AttemptAnswer.objects.create(
+                attempt=attempt, question=self.question, is_correct=bool(i % 2),
+                answered_at=timezone.now() + datetime.timedelta(minutes=i),
+                question_difficulty_at_answer=1500.0, learner_ability_at_answer=1500.0,
+            )
+
+    def test_attempts_default_to_real(self):
+        attempt = QuizAttempt.objects.create(
+            learner=self.learner, sop=self.sop, job_role=self.role)
+        self.assertFalse(attempt.is_synthetic)
+
+    def test_synthetic_interactions_are_excluded_from_evaluation(self):
+        self._attempt(synthetic=True, count=6)
+        sequences, report = evaluation.load_interactions()
+        self.assertEqual(report.excluded_synthetic, 6)
+        self.assertEqual(report.usable, 0)
+        self.assertEqual(sequences, {})
+
+    def test_real_interactions_are_kept_alongside_synthetic_ones(self):
+        self._attempt(synthetic=True, count=6)
+        self._attempt(synthetic=False, count=6)
+        _sequences, report = evaluation.load_interactions()
+        self.assertEqual(report.excluded_synthetic, 6)
+        self.assertEqual(report.usable, 6)
+
+    def test_synthetic_can_be_included_explicitly_for_mechanism_checks(self):
+        self._attempt(synthetic=True, count=6)
+        _sequences, report = evaluation.load_interactions(include_synthetic=True)
+        self.assertEqual(report.excluded_synthetic, 0)
+        self.assertEqual(report.usable, 6)
+
+    def test_report_declares_the_synthetic_exclusion(self):
+        self._attempt(synthetic=True, count=6)
+        result = evaluation.evaluate()
+        self.assertEqual(result["dataset"]["excluded_synthetic"], 6)
+        self.assertIn(
+            "Synthetic demo interactions (QuizAttempt.is_synthetic) are excluded by default.",
+            result["leakage_controls"],
+        )
+
+
+class EvaluationHarnessTests(TestCase):
+    """Batch C — the offline evaluation harness.
+
+    These tests protect the harness's scientific validity, not any model's score. The fixtures
+    here are tiny and synthetic *by design*: they exist to prove the mechanism (ordering,
+    leakage boundaries, gating) behaves correctly. They are never a dataset, and no number
+    produced from them is a result about this project.
+    """
+
+    def setUp(self):
+        self.learner = get_user_model().objects.create_user(username="rohit", password="demo12345")
+        self.other = get_user_model().objects.create_user(username="priya", password="demo12345")
+        self.role = JobRole.objects.create(name="Production Operator", department="Production")
+        self.sop = SOPDocument.objects.create(
+            title="Cleanroom", sop_code="SOP-990", version="v1.0", department="P",
+            file="f.txt", status="processed",
+        )
+        self.chunk_a = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="A", section_title="S1", chunking_strategy="heading")
+        self.chunk_b = SOPChunk.objects.create(
+            sop=self.sop, chunk_text="B", section_title="S2", chunking_strategy="heading")
+        self.questions = []
+        for i in range(6):
+            self.questions.append(Question.objects.create(
+                sop=self.sop, job_role=self.role, question_text=f"Q{i}?", explanation="B.",
+                status="approved", source_chunk=self.chunk_a if i % 2 == 0 else self.chunk_b,
+            ))
+
+    def _interaction(self, learner, question, correct, minutes, difficulty=1500.0,
+                     ability=1500.0, timestamped=True, attempt=None):
+        """Create one recorded interaction directly. Fixture construction only."""
+        attempt = attempt or QuizAttempt.objects.create(
+            learner=learner, sop=self.sop, job_role=self.role,
+        )
+        return AttemptAnswer.objects.create(
+            attempt=attempt, question=question, is_correct=correct,
+            answered_at=(timezone.now() + datetime.timedelta(minutes=minutes)) if timestamped else None,
+            question_difficulty_at_answer=difficulty if timestamped else None,
+            learner_ability_at_answer=ability if timestamped else None,
+        )
+
+    def _sequence(self, learner, pattern, start=0):
+        """pattern: list of bools, one interaction each, strictly increasing in time."""
+        for i, correct in enumerate(pattern):
+            self._interaction(learner, self.questions[i % len(self.questions)], correct, start + i)
+
+    # ---- 1 / 8: temporal ordering and per-learner split -------------------------
+    def test_1_interactions_are_ordered_by_answered_at(self):
+        # Inserted out of chronological order on purpose.
+        self._interaction(self.learner, self.questions[0], True, minutes=30)
+        self._interaction(self.learner, self.questions[1], False, minutes=10)
+        self._interaction(self.learner, self.questions[2], True, minutes=20)
+        self._interaction(self.learner, self.questions[3], False, minutes=40)
+        self._interaction(self.learner, self.questions[4], True, minutes=50)
+
+        sequences, _ = evaluation.load_interactions()
+        times = [e.answered_at for e in sequences[self.learner.id]]
+        self.assertEqual(times, sorted(times))
+
+    def test_8_split_is_per_learner_and_temporal(self):
+        self._sequence(self.learner, [True] * 10)
+        self._sequence(self.other, [False] * 10, start=100)
+
+        sequences, report = evaluation.load_interactions()
+        self.assertEqual(report.learners, 2)
+        for events in sequences.values():
+            rows = evaluation.build_features(events)
+            train, test = evaluation.temporal_split(rows, train_fraction=0.7)
+            self.assertEqual(len(train), 7)
+            self.assertEqual(len(test), 3)
+            # every training row precedes every evaluation row within this learner
+            self.assertLess(len(train), len(rows))
+
+    # ---- 2 / 5 / 6: the leakage boundary ----------------------------------------
+    def test_2_history_never_contains_the_future(self):
+        """Row i's prior counts must equal the outcomes of interactions before i only."""
+        pattern = [True, False, True, True, False, False, True]
+        self._sequence(self.learner, pattern)
+
+        sequences, _ = evaluation.load_interactions()
+        rows = evaluation.build_features(sequences[self.learner.id])
+
+        running_correct = 0
+        for i, row in enumerate(rows):
+            self.assertEqual(row.prior_total, i)
+            self.assertEqual(row.prior_correct, running_correct)
+            if pattern[i]:
+                running_correct += 1
+        # the last row cannot know the final outcome
+        self.assertEqual(rows[-1].prior_total, len(pattern) - 1)
+
+    def test_5_chunk_history_excludes_the_target_interaction(self):
+        self._sequence(self.learner, [True, True, True, True, True, True])
+        sequences, _ = evaluation.load_interactions()
+        rows = evaluation.build_features(sequences[self.learner.id])
+        self.assertEqual(rows[0].chunk_history, [])          # nothing precedes the first
+        self.assertEqual(len(rows[2].chunk_history), 1)      # only the earlier same-chunk answer
+
+    def test_6_target_is_not_reachable_as_a_model_feature(self):
+        """`target` exists on the row for scoring, but no baseline may consume it."""
+        self._sequence(self.learner, [True, False, True, False, True, True])
+        sequences, _ = evaluation.load_interactions()
+        rows = evaluation.build_features(sequences[self.learner.id])
+
+        for baseline_cls in evaluation.DEFAULT_BASELINES:
+            model = baseline_cls()
+            model.fit(rows)
+            with self.subTest(baseline=model.name):
+                row = rows[-1]
+                flipped = evaluation.FeatureRow(**{**row.__dict__, "target": not row.target})
+                self.assertEqual(model.predict(row), model.predict(flipped))
+
+    # ---- 3: rows without temporal data are excluded, not imputed ----------------
+    def test_3_rows_without_answered_at_are_excluded(self):
+        self._sequence(self.learner, [True] * 6)
+        for i in range(4):
+            self._interaction(self.learner, self.questions[i], True, minutes=0, timestamped=False)
+
+        sequences, report = evaluation.load_interactions()
+        self.assertEqual(report.excluded_no_timestamp, 4)
+        self.assertEqual(len(sequences[self.learner.id]), 6)
+        self.assertEqual(report.total_rows, 10)
+
+    def test_3b_rows_without_elo_snapshot_are_excluded(self):
+        self._sequence(self.learner, [True] * 6)
+        answer = self._interaction(self.learner, self.questions[0], True, minutes=99)
+        AttemptAnswer.objects.filter(pk=answer.pk).update(question_difficulty_at_answer=None)
+
+        _sequences, report = evaluation.load_interactions()
+        self.assertEqual(report.excluded_no_snapshot, 1)
+
+    # ---- 4: THE leakage test ---------------------------------------------------
+    def test_4_live_elo_changes_do_not_alter_historical_features(self):
+        """Changing a question's CURRENT rating must not move a recorded interaction's feature.
+
+        This is the property the whole harness rests on: without it, the difficulty attributed
+        to a past answer would drift with every later answer, feeding the outcome back into its
+        own feature.
+        """
+        self._sequence(self.learner, [True] * 6)
+        before = [e.difficulty for e in evaluation.load_interactions()[0][self.learner.id]]
+
+        Question.objects.all().update(elo_rating=900.0)   # violent change to live ratings
+
+        after = [e.difficulty for e in evaluation.load_interactions()[0][self.learner.id]]
+        self.assertEqual(before, after)
+        self.assertTrue(all(d == 1500.0 for d in after))
+        self.assertEqual(Question.objects.first().elo_rating, 900.0)  # live really did change
+
+    # ---- 7: duplicates ----------------------------------------------------------
+    def test_7_repeated_question_does_not_distort_ordering(self):
+        """The same question answered twice is two interactions, ordered, not merged."""
+        self._interaction(self.learner, self.questions[0], False, minutes=1)
+        self._interaction(self.learner, self.questions[0], True, minutes=2)
+        self._sequence(self.learner, [True] * 4, start=10)
+
+        sequences, _ = evaluation.load_interactions()
+        rows = evaluation.build_features(sequences[self.learner.id])
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(rows[1].chunk_history, [False])   # the earlier attempt, newest-first
+        self.assertEqual(rows[1].chunk_prior_incorrect, 1)
+
+    # ---- 9 / 10: gating and honest metrics --------------------------------------
+    def test_9_insufficient_data_gate_triggers_on_a_small_dataset(self):
+        self._sequence(self.learner, [True, False] * 4)
+        result = evaluation.evaluate()
+        self.assertEqual(result["status"], "INSUFFICIENT_DATA")
+        self.assertTrue(result["blockers"])
+        for entry in result["baselines"].values():
+            self.assertIn("NOT a performance claim", entry["interpretation"])
+
+    def test_9b_empty_dataset_is_reported_not_crashed(self):
+        result = evaluation.evaluate()
+        self.assertEqual(result["status"], "INSUFFICIENT_DATA")
+        self.assertEqual(result["dataset"]["usable"], 0)
+
+    def test_10_metrics_report_insufficient_rather_than_fabricating(self):
+        self.assertEqual(evaluation.roc_auc([True, True], [0.6, 0.7]), evaluation.INSUFFICIENT)
+        self.assertEqual(evaluation.roc_auc([False, False], [0.6, 0.7]), evaluation.INSUFFICIENT)
+        self.assertEqual(evaluation.pr_auc([False, False], [0.6, 0.7]), evaluation.INSUFFICIENT)
+        self.assertEqual(evaluation.log_loss([], []), evaluation.INSUFFICIENT)
+        self.assertEqual(evaluation.brier_score([], []), evaluation.INSUFFICIENT)
+
+    def test_10b_metrics_are_correct_on_known_inputs(self):
+        """Sanity-check the pure-Python implementations against hand-computable cases."""
+        # perfect separation
+        self.assertAlmostEqual(evaluation.roc_auc([False, False, True, True], [.1, .2, .8, .9]), 1.0)
+        # inverted ranking
+        self.assertAlmostEqual(evaluation.roc_auc([True, True, False, False], [.1, .2, .8, .9]), 0.0)
+        # all ties -> no ranking information
+        self.assertAlmostEqual(evaluation.roc_auc([True, False, True, False], [.5] * 4), 0.5)
+        # Brier for a constant 0.5 prediction is always 0.25
+        self.assertAlmostEqual(evaluation.brier_score([True, False], [0.5, 0.5]), 0.25)
+        # log loss for a confident correct prediction is near zero
+        self.assertLess(evaluation.log_loss([True], [0.99]), 0.02)
+
+    # ---- 11: calibration --------------------------------------------------------
+    def test_11_calibration_table_reports_bins_and_flags_thin_ones(self):
+        y = [True] * 30 + [False] * 30
+        p = [0.9] * 30 + [0.1] * 30
+        table = evaluation.calibration_table(y, p, bins=5, min_per_bin=5)
+        populated = [b for b in table if b["count"] >= 5]
+        self.assertEqual(len(populated), 2)
+        low = next(b for b in table if b["bin"] == "0.0-0.2")
+        high = next(b for b in table if b["bin"] == "0.8-1.0")
+        self.assertAlmostEqual(low["observed_rate"], 0.0)
+        self.assertAlmostEqual(high["observed_rate"], 1.0)
+        # a bin with too few observations must not report a rate
+        thin = next(b for b in table if b["count"] == 0)
+        self.assertEqual(thin["observed_rate"], evaluation.INSUFFICIENT)
+
+    # ---- 12: the rule-engine adapter is faithful --------------------------------
+    def test_12_current_engine_adapter_reproduces_production_decisions(self):
+        """The adapter must call adaptive.py, not approximate it."""
+        row = evaluation.FeatureRow(
+            learner_id=1, prior_total=3, prior_correct=0, prior_incorrect=3,
+            chunk_prior_total=3, chunk_prior_correct=0, chunk_prior_incorrect=3,
+            difficulty=1500.0, ability=1500.0,
+            chunk_history=[False, False, False], target=False,
+        )
+        model = evaluation.CurrentAdaptiveEngineBaseline()
+        model.fit([row])
+        # 0/3 -> weighted accuracy 0% -> HIGH in production, and P(correct) 0.0 here
+        self.assertEqual(model.priority(row), adaptive.PRIORITY_HIGH)
+        self.assertAlmostEqual(model.predict(row), 0.0)
+
+        strong = evaluation.FeatureRow(**{**row.__dict__, "chunk_history": [True, True, True]})
+        self.assertEqual(model.priority(strong), adaptive.PRIORITY_LOW)
+        self.assertAlmostEqual(model.predict(strong), 1.0)
+
+    def test_12b_engine_adapter_abstains_to_base_rate_without_evidence(self):
+        train = [
+            evaluation.FeatureRow(
+                learner_id=1, prior_total=0, prior_correct=0, prior_incorrect=0,
+                chunk_prior_total=0, chunk_prior_correct=0, chunk_prior_incorrect=0,
+                difficulty=1500.0, ability=1500.0, chunk_history=[], target=t,
+            ) for t in (True, True, False, False)
+        ]
+        model = evaluation.CurrentAdaptiveEngineBaseline()
+        model.fit(train)
+        self.assertAlmostEqual(model.predict(train[0]), 0.5)  # base rate, not a guess
+
+    # ---- 13: Elo baseline uses snapshots ---------------------------------------
+    def test_13_elo_baseline_uses_pre_answer_snapshots(self):
+        model = evaluation.EloBaseline()
+        equal = evaluation.FeatureRow(
+            learner_id=1, prior_total=0, prior_correct=0, prior_incorrect=0,
+            chunk_prior_total=0, chunk_prior_correct=0, chunk_prior_incorrect=0,
+            difficulty=1500.0, ability=1500.0, chunk_history=[], target=True,
+        )
+        self.assertAlmostEqual(model.predict(equal), 0.5, places=6)
+
+        stronger = evaluation.FeatureRow(**{**equal.__dict__, "ability": 1900.0})
+        self.assertGreater(model.predict(stronger), 0.9)
+        harder = evaluation.FeatureRow(**{**equal.__dict__, "difficulty": 1900.0})
+        self.assertLess(model.predict(harder), 0.1)
+
+    # ---- 14: logistic baseline ---------------------------------------------------
+    def test_14_logistic_baseline_fits_without_future_information(self):
+        self._sequence(self.learner, [True, False, True, True, False, True, False, True])
+        sequences, _ = evaluation.load_interactions()
+        rows = evaluation.build_features(sequences[self.learner.id])
+        train, test = evaluation.temporal_split(rows)
+
+        model = evaluation.LogisticBaseline(epochs=100)
+        model.fit(train)
+        self.assertTrue(model.fitted)
+        for row in test:
+            p = model.predict(row)
+            self.assertGreaterEqual(p, 0.0)
+            self.assertLessEqual(p, 1.0)
+        # fitted only on the training split -- refitting on train alone must be identical
+        again = evaluation.LogisticBaseline(epochs=100)
+        again.fit(train)
+        self.assertEqual(model.weights, again.weights)
+
+    def test_14b_logistic_handles_a_constant_feature_without_nan(self):
+        """Constant columns are common at small n; a zero-variance divide would poison every
+        prediction with NaN rather than failing loudly."""
+        rows = [
+            evaluation.FeatureRow(
+                learner_id=1, prior_total=i, prior_correct=i, prior_incorrect=0,
+                chunk_prior_total=i, chunk_prior_correct=i, chunk_prior_incorrect=0,
+                difficulty=1500.0, ability=1500.0, chunk_history=[], target=bool(i % 2),
+            ) for i in range(6)
+        ]
+        model = evaluation.LogisticBaseline(epochs=50)
+        model.fit(rows)
+        for row in rows:
+            p = model.predict(row)
+            self.assertFalse(math.isnan(p))
+
+    # ---- report shape -----------------------------------------------------------
+    def test_report_declares_status_and_leakage_controls(self):
+        self._sequence(self.learner, [True, False] * 3)
+        result = evaluation.evaluate()
+        markdown = evaluation.to_markdown(result)
+        self.assertIn("NO VALID MODEL PERFORMANCE CLAIM", markdown)
+        self.assertIn("Leakage controls", markdown)
+        # 5 since synthetic-demo exclusion was added as an explicit control.
+        self.assertEqual(len(result["leakage_controls"]), 5)
+        json.loads(evaluation.to_json(result))  # must be machine-readable
 
 
 class LearningPathExplainabilityTests(APITestCase):
@@ -1171,6 +2439,7 @@ class LearningPathExplainabilityTests(APITestCase):
         attempt_id = self.client.post(
             "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
         ).data["id"]
+        _offer_exactly(attempt_id, [a["question"] for a in answers if a.get("question")])
         return self.client.post(
             f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
         )
@@ -1490,6 +2759,7 @@ class SectionMasteryTests(APITestCase):
         attempt_id = self.client.post(
             "/api/attempts/quiz-attempts/", {"sop": self.sop.id, "job_role": self.role.id}, format="json"
         ).data["id"]
+        _offer_exactly(attempt_id, [a["question"] for a in answers if a.get("question")])
         return self.client.post(
             f"/api/attempts/quiz-attempts/{attempt_id}/submit/", {"answers": answers}, format="json"
         )
